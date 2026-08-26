@@ -463,8 +463,9 @@ with tab_overview:
                 textinfo="percent",
                 hovertemplate="%{label}: $%{value:,.2f}<extra></extra>",
             ))
+            donut.update_layout(**PLOTLY_DARK_LAYOUT)
             donut.update_layout(
-                **PLOTLY_DARK_LAYOUT, height=300, margin=dict(l=10, r=10, t=10, b=10),
+                height=300, margin=dict(l=10, r=10, t=10, b=10),
                 showlegend=True, legend=dict(orientation="h", y=-0.1, bgcolor="rgba(0,0,0,0)"),
                 annotations=[dict(text=f"${equity_total:,.0f}", x=0.5, y=0.5, font_size=18, font_color="#f2f4f8", showarrow=False)],
             )
@@ -491,8 +492,9 @@ with tab_overview:
                 marker=dict(color="#3498db"),
                 hovertemplate="%{y}: $%{x:,.2f}<extra></extra>",
             ))
+            bar.update_layout(**PLOTLY_DARK_LAYOUT)
             bar.update_layout(
-                **PLOTLY_DARK_LAYOUT, height=300, margin=dict(l=10, r=10, t=10, b=10),
+                height=300, margin=dict(l=10, r=10, t=10, b=10),
                 yaxis=dict(autorange="reversed", gridcolor="rgba(255,255,255,0.06)"),
                 xaxis=dict(title="USD alocado", gridcolor="rgba(255,255,255,0.06)"),
             )
@@ -525,7 +527,8 @@ with tab_performance:
             x=eq_df["epoch_index"], y=eq_df["peak_equity"], name="Pico histórico",
             line=dict(color="#95a5a6", dash="dot", width=1.5),
         ))
-        fig.update_layout(**PLOTLY_DARK_LAYOUT, xaxis_title="Época", yaxis_title="USD", height=380, margin=dict(l=10, r=10, t=20, b=10))
+        fig.update_layout(**PLOTLY_DARK_LAYOUT)
+        fig.update_layout(xaxis_title="Época", yaxis_title="USD", height=380, margin=dict(l=10, r=10, t=20, b=10))
         st.plotly_chart(fig, use_container_width=True)
 
         st.subheader("Drawdown (distância do pico histórico)")
@@ -535,7 +538,8 @@ with tab_performance:
             line=dict(color="#e74c3c", width=1.5), fill="tozeroy", fillcolor="rgba(231,76,60,0.12)",
         ))
         fig_dd.add_hline(y=-10, line=dict(color="#e74c3c", dash="dash", width=1), annotation_text="disjuntor -10%", annotation_font_color="#e74c3c")
-        fig_dd.update_layout(**PLOTLY_DARK_LAYOUT, xaxis_title="Época", yaxis_title="% do pico", height=260, margin=dict(l=10, r=10, t=20, b=10))
+        fig_dd.update_layout(**PLOTLY_DARK_LAYOUT)
+        fig_dd.update_layout(xaxis_title="Época", yaxis_title="% do pico", height=260, margin=dict(l=10, r=10, t=20, b=10))
         st.plotly_chart(fig_dd, use_container_width=True)
         st.caption("Linha tracejada mostra o limite do disjuntor de segurança (MAX_CUM_LOSS_PAUSE_PCT=10%) -- "
                    "só para referência visual, o disjuntor de verdade roda dentro do motor, intocado.")
@@ -573,7 +577,8 @@ with tab_market:
             fig2.add_trace(go.Scatter(x=hist_df["ts"], y=hist_df["canal_saida_min"], name=f"Donchian saída ({N_EXIT_HOURS//24}d) fundo",
                                        line=dict(color="rgba(243,156,18,0.65)", dash="dot", width=1)))
             fig2.add_trace(go.Scatter(x=hist_df["ts"], y=hist_df["price"], name="Preço", line=dict(color="#3498db", width=2.2)))
-            fig2.update_layout(**PLOTLY_DARK_LAYOUT, height=460, margin=dict(l=10, r=10, t=20, b=10))
+            fig2.update_layout(**PLOTLY_DARK_LAYOUT)
+            fig2.update_layout(height=460, margin=dict(l=10, r=10, t=20, b=10))
             st.plotly_chart(fig2, use_container_width=True)
             st.caption("Canais calculados aqui só para visualização (aproximação com pandas.rolling sobre o "
                        "price_history do último checkpoint) -- o motor de verdade usa donchian_engine._rolling_extreme, "
