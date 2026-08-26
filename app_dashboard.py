@@ -59,15 +59,18 @@ import plotly.graph_objects as go  # noqa: E402
 N_ENTRY_HOURS = 480
 N_EXIT_HOURS = 240
 
-ALLOWED_CLOUD_HOST = "db.dutmxvqluuxfexbdfbxm.supabase.co"  # projeto "bob-paper-live", unico autorizado
+ALLOWED_CLOUD_HOSTS = {
+    "db.dutmxvqluuxfexbdfbxm.supabase.co",   # conexao direta (IPv6 -- pode falhar em redes sem saida IPv6, ex. Streamlit Cloud)
+    "aws-0-sa-east-1.pooler.supabase.com",   # Supavisor pooler (IPv4-compativel), mesmo projeto "bob-paper-live"
+}  # ambos SEMPRE do mesmo projeto dedicado "bob-paper-live" (dutmxvqluuxfexbdfbxm) -- nunca outro projeto/host
 
 
 def _minimal_cloud_safety_check(cfg):
     """Checagem FAIL CLOSED, autocontida (sem importar environment_guard.py
     -- ver docstring do topo). So' usada no caminho Streamlit Cloud."""
     host = str(cfg.get("DB_HOST", "")).strip().lower()
-    if host != ALLOWED_CLOUD_HOST:
-        st.error(f"BLOQUEADO: DB_HOST='{host}' nao e' o projeto Supabase autorizado ({ALLOWED_CLOUD_HOST}).")
+    if host not in ALLOWED_CLOUD_HOSTS:
+        st.error(f"BLOQUEADO: DB_HOST='{host}' nao e' um host autorizado do projeto Supabase 'bob-paper-live' ({sorted(ALLOWED_CLOUD_HOSTS)}).")
         st.stop()
     if str(cfg.get("DRY_RUN", "")).strip().lower() != "true":
         st.error("BLOQUEADO: DRY_RUN precisa ser 'true' -- nunca deve rodar sem isso.")
