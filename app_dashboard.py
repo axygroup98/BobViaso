@@ -21,6 +21,14 @@ carregados pelas funcoes de leitura abaixo). Nenhuma query nova de
 escrita, nenhuma tabela nova, nenhuma dependencia nova alem do que ja
 estava em requirements.txt (plotly ja cobre donut/barra/area).
 
+MISSAO 15 -- Estatisticas de trades (taxa de acerto, fator de lucro) lidas
+de mission7_experiences (tabela ja existente, escrita pelo proprio motor
+via mission7_run.insert_experiences/apply_resolved -- SOMENTE LEITURA
+aqui, nenhuma escrita nova) + historico do monitor de edge por epoca
+(mesmo jsonb de checkpoints ja usado na curva de capital). Enquanto nao
+houver trades fechados/checkpoints suficientes na nuvem, o painel mostra
+isso com clareza -- nunca inventa numero.
+
 COMO A CONFIGURACAO E' CARREGADA (2 caminhos, auto-detectados):
   1. LOCAL (no PC do laboratorio): le' .env.cloud e usa o guard COMPLETO
      ja existente (environment_guard.assert_cloud_paper_live_safe) --
@@ -314,6 +322,43 @@ def load_market_states(sim_id, symbol, limit=1000):
 
 
 @st.cache_data(ttl=15)
+def load_trade_stats(sim_id):
+    """MISSAO 15 -- estatisticas de trades RESOLVIDOS (ja fechados), lidas
+    direto de mission7_experiences (tabela ja existente, escrita pelo
+    proprio motor via mission7_run.insert_experiences/apply_resolved --
+    NENHUMA query nova de escrita, so' leitura). Enquanto nao houver trades
+    fechados na nuvem (normal logo apos uma migracao enxuta, ou quando
+    ainda nao passou tempo real suficiente pra' fechar uma epoca), volta
+    vazio -- o painel mostra isso com clareza, nunca inventa numero."""
+    with get_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            "select symbol, epoch_index, entry_price, exit_price, pnl_percent, holding_time_hours, "
+            "resolution_sim_time from mission7_experiences "
+            "where simulation_id=%s and resolved=true order by resolution_sim_time desc",
+            (sim_id,),
+        )
+        rows = cur.fetchall()
+    return pd.DataFrame(rows, columns=["symbol", "epoch_index", "entry_price", "exit_price", "pnl_percent", "holding_time_hours", "resolution_sim_time"])
+
+
+@st.cache_data(ttl=15)
+def load_edge_monitor_history(sim_id):
+    """Historico do estado do monitor de edge (NORMAL/ATENCAO/...) por
+    epoca, extraido do mesmo jsonb de checkpoints ja usado em
+    load_equity_history -- so' mais um campo do mesmo state, sem query
+    nova de escrita."""
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            "select epoch_index, simulated_time, "
+            "coalesce(state->'capital'->'sizing_state'->>'current_state', 'DESCONHECIDO') as edge_state "
+            "from mission7_checkpoints where simulation_id=%s order by epoch_index asc",
+            (sim_id,),
+        )
+        rows = cur.fetchall()
+    return pd.DataFrame(rows, columns=["epoch_index", "simulated_time", "edge_state"])
+
+
+@st.cache_data(ttl=15)
 def load_bot_control(sim_id):
     with get_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         cur.execute("select * from mission7_bot_control where simulation_id=%s", (sim_id,))
@@ -348,6 +393,8 @@ def _edge_badge(current_state):
     cls = {"NORMAL": "bob-badge-ok", "ATENCAO": "bob-badge-warn", "ATENÇÃO": "bob-badge-warn"}.get(state, "bob-badge-bad" if state not in ("—",) else "bob-badge-neutral")
     return f"<span class='bob-badge {cls}'>{state}</span>"
 
+
+EDGE_STATE_COLOR = {"NORMAL": "#2ecc71", "ATENCAO": "#f39c12", "DEFENSIVO": "#e74c3c", "PAUSA": "#e74c3c", "DESCONHECIDO": "#95a5a6"}
 
 PLOTLY_DARK_LAYOUT = dict(
     paper_bgcolor="rgba(0,0,0,0)",
@@ -432,7 +479,9 @@ sizing_state = cap.get("sizing_state", {}) if state else {}
 st.markdown(_status_pill(is_paused), unsafe_allow_html=True)
 st.write("")
 
-tab_overview, tab_performance, tab_market = st.tabs(["📊 Visão Geral", "📈 Performance & Risco", "💹 Mercado & Donchian"])
+tab_overview, tab_performance, tab_trades, tab_market = st.tabs(
+    ["📊 Visão Geral", "📈 Performance & Risco", "📒 Trades", "💹 Mercado & Donchian"]
+)
 
 # ---------------------------------------------------------------------------
 # ABA 1 -- Visão Geral
@@ -486,6 +535,8 @@ with tab_overview:
                  "atr_pct_na_entrada": p.get("atr_pct_at_entry")}
                 for sym, p in open_positions.items()
             ]).sort_values("capital_alocado_usd", ascending=False)
+            if equity_total > 0:
+                pos_df["% do capital total"] = (pos_df["capital_alocado_usd"] / equity_total * 100).round(2)
 
             bar = go.Figure(go.Bar(
                 x=pos_df["capital_alocado_usd"], y=pos_df["símbolo"], orientation="h",
@@ -510,7 +561,7 @@ with tab_performance:
     eq_df = load_equity_history(LIVE_SIM_ID)
     if eq_df.empty or len(eq_df) < 2:
         st.info("Só existe 1 checkpoint na nuvem até agora (migração enxuta trouxe só o último). "
-                "A curva cresce a cada rodada de _bob_cloud_live_step.py -- volte depois de alguns dias.")
+                "A curva cresce a cada época real processada por _bob_cloud_live_step.py -- volte depois de alguns dias.")
         if not eq_df.empty:
             st.dataframe(eq_df, use_container_width=True, hide_index=True)
     else:
@@ -522,13 +573,16 @@ with tab_performance:
         fig.add_trace(go.Scatter(
             x=eq_df["epoch_index"], y=eq_df["equity_total"], name="Capital total",
             line=dict(color="#2ecc71", width=2), fill="tozeroy", fillcolor="rgba(46,204,113,0.08)",
+            customdata=eq_df["simulated_time"].astype(str),
+            hovertemplate="Época %{x} (%{customdata})<br>Capital: $%{y:,.2f}<extra></extra>",
         ))
         fig.add_trace(go.Scatter(
             x=eq_df["epoch_index"], y=eq_df["peak_equity"], name="Pico histórico",
             line=dict(color="#95a5a6", dash="dot", width=1.5),
+            hovertemplate="Pico: $%{y:,.2f}<extra></extra>",
         ))
         fig.update_layout(**PLOTLY_DARK_LAYOUT)
-        fig.update_layout(xaxis_title="Época", yaxis_title="USD", height=380, margin=dict(l=10, r=10, t=20, b=10))
+        fig.update_layout(xaxis_title="Época", yaxis_title="USD", height=380, margin=dict(l=10, r=10, t=20, b=10), hovermode="x unified")
         st.plotly_chart(fig, use_container_width=True)
 
         st.subheader("Drawdown (distância do pico histórico)")
@@ -539,13 +593,75 @@ with tab_performance:
         ))
         fig_dd.add_hline(y=-10, line=dict(color="#e74c3c", dash="dash", width=1), annotation_text="disjuntor -10%", annotation_font_color="#e74c3c")
         fig_dd.update_layout(**PLOTLY_DARK_LAYOUT)
-        fig_dd.update_layout(xaxis_title="Época", yaxis_title="% do pico", height=260, margin=dict(l=10, r=10, t=20, b=10))
+        fig_dd.update_layout(xaxis_title="Época", yaxis_title="% do pico", height=240, margin=dict(l=10, r=10, t=20, b=10))
         st.plotly_chart(fig_dd, use_container_width=True)
         st.caption("Linha tracejada mostra o limite do disjuntor de segurança (MAX_CUM_LOSS_PAUSE_PCT=10%) -- "
                    "só para referência visual, o disjuntor de verdade roda dentro do motor, intocado.")
 
+    st.subheader("Monitor de edge ao longo das épocas")
+    edge_df = load_edge_monitor_history(LIVE_SIM_ID)
+    if edge_df.empty or len(edge_df) < 2:
+        st.info("Ainda não há histórico suficiente do monitor de edge (precisa de mais de 1 checkpoint). "
+                "Estado atual, no último checkpoint: " + (sizing_state.get("current_state") or "—"))
+    else:
+        edge_df = edge_df.copy()
+        state_order = {"NORMAL": 0, "ATENCAO": 1, "DEFENSIVO": 2, "PAUSA": 3, "DESCONHECIDO": -1}
+        edge_df["nivel"] = edge_df["edge_state"].map(state_order).fillna(-1)
+        colors = [EDGE_STATE_COLOR.get(s, "#95a5a6") for s in edge_df["edge_state"]]
+        fig_edge = go.Figure(go.Scatter(
+            x=edge_df["epoch_index"], y=edge_df["nivel"], mode="lines+markers",
+            line=dict(color="#3498db", width=1.5, shape="hv"),
+            marker=dict(color=colors, size=8, line=dict(color="#0b0f1a", width=1)),
+            text=edge_df["edge_state"], hovertemplate="Época %{x}: %{text}<extra></extra>",
+        ))
+        fig_edge.update_layout(**PLOTLY_DARK_LAYOUT)
+        fig_edge.update_layout(
+            height=200, margin=dict(l=10, r=10, t=10, b=10), xaxis_title="Época",
+            yaxis=dict(tickmode="array", tickvals=[0, 1, 2, 3], ticktext=["NORMAL", "ATENÇÃO", "DEFENSIVO", "PAUSA"],
+                       gridcolor="rgba(255,255,255,0.06)"),
+        )
+        st.plotly_chart(fig_edge, use_container_width=True)
+
 # ---------------------------------------------------------------------------
-# ABA 3 -- Mercado & Donchian
+# ABA 3 -- Trades (MISSAO 15)
+# ---------------------------------------------------------------------------
+with tab_trades:
+    st.subheader("Estatísticas de trades fechados")
+    trades_df = load_trade_stats(LIVE_SIM_ID)
+
+    if trades_df.empty:
+        st.info(
+            "Ainda não há trades fechados registrados na nuvem para esta simulação -- normal logo após a migração "
+            "enxuta (Missão 11), ou enquanto o tempo real ainda não completou uma época nova (24h desde o último "
+            "checkpoint). Assim que o motor fechar a primeira posição em uma época real, as estatísticas abaixo "
+            "aparecem automaticamente, calculadas a partir de mission7_experiences -- nenhum número é estimado ou "
+            "inventado enquanto não houver trade de verdade."
+        )
+    else:
+        n_total = len(trades_df)
+        wins = trades_df[trades_df["pnl_percent"] > 0]
+        losses = trades_df[trades_df["pnl_percent"] <= 0]
+        win_rate = len(wins) / n_total * 100 if n_total else 0.0
+        gross_win = wins["pnl_percent"].sum()
+        gross_loss = abs(losses["pnl_percent"].sum())
+        profit_factor = (gross_win / gross_loss) if gross_loss > 0 else float("inf") if gross_win > 0 else 0.0
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Trades fechados", n_total)
+        c2.metric("Taxa de acerto", f"{win_rate:.1f}%")
+        c3.metric("Fator de lucro", "∞" if profit_factor == float("inf") else f"{profit_factor:.2f}")
+        c4.metric("PnL médio por trade", f"{trades_df['pnl_percent'].mean():.2f}%")
+
+        st.caption("Taxa de acerto = trades com pnl_percent > 0 / total. Fator de lucro = soma dos ganhos ÷ soma "
+                   "absoluta das perdas (em pnl_percent) -- ambos calculados só sobre trades já RESOLVIDOS "
+                   "(coluna `resolved=true` em mission7_experiences).")
+
+        st.write("")
+        st.subheader("Histórico de trades (mais recentes primeiro)")
+        st.dataframe(trades_df, use_container_width=True, hide_index=True)
+
+# ---------------------------------------------------------------------------
+# ABA 4 -- Mercado & Donchian
 # ---------------------------------------------------------------------------
 with tab_market:
     st.subheader("Preço e canais de Donchian (dados ao vivo, por símbolo)")
