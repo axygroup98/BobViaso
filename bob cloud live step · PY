@@ -68,6 +68,38 @@ so' endpoints publicos, sem chave, sem ordem real):
      (caso normal: rodou cedo demais, ainda nao fechou candle novo),
      avisa claramente e ainda assim chama o motor normalmente -- que ja'
      sabe lidar com "sem dado novo" (nao fecha epoca, nao inventa nada).
+
+MISSAO 17 -- venda manual via painel (dashboard). Fecha uma posicao aberta
+a pedido explicito do usuario, ANTES do criterio tecnico do motor. Ver
+_apply_manual_close/_process_manual_close_requests/
+_load_latest_checkpoint_with_manual_closes mais abaixo.
+
+MISSAO 21 -- CORRECAO CRITICA na Missao 17, encontrada em teste com dado
+real (2026-08-27, pedido de venda manual de ZECUSDT): a versao original
+gravava a linha em mission7_experiences e marcava o pedido como
+'executed' IMEDIATAMENTE ao aplicar o fechamento em memoria -- mas o
+fechamento em memoria so' se torna permanente se a PROXIMA epoca natural
+realmente fechar e escrever um checkpoint novo (mission8_donchian_v1_
+sizing_v4_run.run() so' faz `continue` sem escrever nada quando a janela
+de 24h ainda nao tem nenhum candle -- ver linha "epoca N: nenhum candle
+... pulando" no run() reusado). No teste real, a epoca seguinte NAO
+fechou nesta rodada (so' 7 candles novos chegaram, nao os suficientes pra
+completar a janela) -- o checkpoint continuou intacto (ZECUSDT ainda
+in_position=true, mesmo capital alocado), mas mission7_experiences ja'
+tinha uma linha dizendo que o trade fechou com +46.53%. Isso e' exatamente
+o tipo de inconsistencia que a regra "nunca escondido/nunca corrompido"
+proibe: o registro de trades diverge silenciosamente da fonte de verdade
+(checkpoint). CORRECAO: separar em 2 fases -- (1) aplica em memoria e
+GUARDA a informacao de fechamento num buffer, SEM gravar nada em
+mission7_experiences nem mudar o status do pedido; (2) SO' DEPOIS que
+mission8_donchian_v1_sizing_v4_run.run() retorna, confirma (consultando
+mission7_checkpoints de novo) se um checkpoint com epoca MAIOR que a base
+foi realmente escrito -- SO' ENTAO grava a experiencia e marca o pedido
+'executed'. Se nenhuma epoca fechou nesta rodada, o pedido continua
+'pending' (nada e' gravado) e e' automaticamente retentado, sem duplicar
+nada, na proxima vez que o script rodar. Os casos que NAO mutam state
+(sem posicao aberta / sem candle) continuam sendo finalizados na hora,
+porque nesses dois casos nao ha nada pendente de persistencia.
 """
 import sys
 import os
@@ -124,6 +156,17 @@ KLINES_PAGE_LIMIT = 1000
 # usado pela venda manual (Missao 17) mais abaixo.
 CAPITAL_PER_POSITION_USD_LIVE = 20.0
 
+# MISSAO 21 -- buffer module-level usado SO' dentro de uma unica execucao
+# deste script (processo novo a cada `python _bob_cloud_live_step.py ...`,
+# entao comeca sempre vazio -- nao ha estado "sujo" entre rodadas). Guarda
+# fechamentos manuais aplicados em memoria por
+# _load_latest_checkpoint_with_manual_closes, que so' viram gravacao real
+# em mission7_experiences/mission7_manual_close_requests se
+# _finalize_manual_closes_if_persisted (chamada em main(), DEPOIS de
+# m8run.run() retornar) confirmar que um checkpoint novo foi escrito.
+_PENDING_MANUAL_CLOSE_FINALIZATIONS = []
+_PENDING_MANUAL_CLOSE_BASE_EPOCH = None
+
 
 def _cloud_pg_conn():
     """Unica funcao NOVA deste script: conexao de nuvem, construida a
@@ -167,12 +210,15 @@ def _apply_manual_close(conn, simulation_id, epoch_index, state, model, fee_pct,
     run_one_epoch() aplica no bloco de saida, so' que disparado por pedido
     do usuario em vez de rompimento de canal/stop-ATR.
 
-    NUNCA insere/altera uma linha de checkpoint aqui -- so' registra 1
-    nova linha em mission7_experiences (transparencia -- nunca esconde o
-    que aconteceu, tag policy_source="fechamento_manual_via_painel") e
-    marca o pedido em mission7_manual_close_requests como
-    executado/pulado/falho. Devolve True se a posicao foi realmente
-    fechada (state mutado)."""
+    MISSAO 21 -- devolve tipos DIFERENTES conforme o caso, de proposito:
+      * sem posicao aberta / sem candle: NAO mutam `state`, entao sao
+        seguros pra finalizar NA HORA (grava o status final direto aqui)
+        -- devolve None (nada pendente).
+      * fechamento aplicado com sucesso: MUTA `state`, mas isso so' vira
+        permanente se um checkpoint novo for escrito depois -- NAO grava
+        nada em mission7_experiences/mission7_manual_close_requests aqui;
+        devolve um dict com tudo que _finalize_manual_closes_if_persisted
+        precisa pra' gravar depois, SE E SO' SE confirmar a persistencia."""
     pos = state.get("positions", {}).get(symbol)
     if not pos or not pos.get("in_position"):
         with conn.cursor() as cur:
@@ -183,7 +229,7 @@ def _apply_manual_close(conn, simulation_id, epoch_index, state, model, fee_pct,
             )
         conn.commit()
         print(f"  [venda manual] {symbol}: pedido #{request_id} pulado -- sem posicao aberta.")
-        return False
+        return None
 
     market_row = _latest_market_row(conn, simulation_id, symbol)
     if market_row is None:
@@ -195,7 +241,7 @@ def _apply_manual_close(conn, simulation_id, epoch_index, state, model, fee_pct,
             )
         conn.commit()
         print(f"  [venda manual] {symbol}: pedido #{request_id} FALHOU -- sem candle nenhum na nuvem.")
-        return False
+        return None
 
     t = int(market_row["open_time"])
     price = float(market_row["price"])
@@ -282,27 +328,23 @@ def _apply_manual_close(conn, simulation_id, epoch_index, state, model, fee_pct,
                                 "nao abre novas posicoes ate reativar; simulacao e demais simbolos continuam."},
         }
 
-    mission7_run.insert_experiences(conn, simulation_id, [experience])
-    if risk_breaker_row is not None:
-        mission7_run.insert_rows(conn, "mission7_risk_breaker_events", [risk_breaker_row], simulation_id)
-
-    with conn.cursor() as cur:
-        cur.execute(
-            "update mission7_manual_close_requests set status='executed', executed_at=now(), execution_note=%s where id=%s",
-            (f"fechado manualmente: preco_saida={price:.8f}, pnl_apos_taxas={pnl_pct_after_fees:.2f}%, "
-             f"capital_liquidado_usd={trade_alloc_usd:.2f}.", request_id),
-        )
-    conn.commit()
-    print(f"  [venda manual] {symbol}: pedido #{request_id} EXECUTADO -- pnl_apos_taxas={pnl_pct_after_fees:.2f}%, "
-          f"capital_liquidado=${trade_alloc_usd:.2f}.")
-    return True
+    print(f"  [venda manual] {symbol}: pedido #{request_id} aplicado EM MEMORIA (pnl_apos_taxas={pnl_pct_after_fees:.2f}%, "
+          f"capital_liquidado=${trade_alloc_usd:.2f}) -- so' fica definitivo se um checkpoint novo for escrito "
+          f"nesta rodada (ver _finalize_manual_closes_if_persisted).")
+    return {
+        "request_id": request_id, "symbol": symbol, "experience": experience,
+        "risk_breaker_row": risk_breaker_row, "trade_alloc_usd": trade_alloc_usd,
+        "pnl_pct_after_fees": pnl_pct_after_fees,
+    }
 
 
 def _process_manual_close_requests(conn, simulation_id, epoch_index, state):
     """Le' pedidos PENDENTES em mission7_manual_close_requests (tabela
     NOVA, aditiva) e aplica cada um, em memoria, no `state` que sera'
-    usado pela PROXIMA epoca natural -- ver _apply_manual_close e a
-    docstring do modulo pra' o raciocinio completo de seguranca causal."""
+    usado pela PROXIMA epoca natural. Devolve a lista de fechamentos que
+    ficaram PENDENTES DE CONFIRMACAO (ver _apply_manual_close/
+    _finalize_manual_closes_if_persisted) -- os casos sem posicao/sem
+    candle ja' se resolvem sozinhos dentro de _apply_manual_close."""
     with conn.cursor() as cur:
         cur.execute(
             "select id, symbol from mission7_manual_close_requests "
@@ -311,13 +353,14 @@ def _process_manual_close_requests(conn, simulation_id, epoch_index, state):
         )
         pending = cur.fetchall()
     if not pending:
-        return False
+        return []
     model = dict(m8run.MODEL_REGISTRY_V4[MODEL_KEY])
-    any_applied = False
+    to_finalize = []
     for request_id, symbol in pending:
-        applied = _apply_manual_close(conn, simulation_id, epoch_index, state, model, m8run.FEE_PCT_DEFAULT, symbol, request_id)
-        any_applied = any_applied or applied
-    return any_applied
+        result = _apply_manual_close(conn, simulation_id, epoch_index, state, model, m8run.FEE_PCT_DEFAULT, symbol, request_id)
+        if result is not None:
+            to_finalize.append(result)
+    return to_finalize
 
 
 # redireciona SO' EM RUNTIME (nenhum arquivo em disco tocado) o load do
@@ -333,18 +376,71 @@ _real_load_latest_checkpoint = mission7_run.load_latest_checkpoint
 
 
 def _load_latest_checkpoint_with_manual_closes(conn, simulation_id):
+    global _PENDING_MANUAL_CLOSE_FINALIZATIONS, _PENDING_MANUAL_CLOSE_BASE_EPOCH
     epoch_index, state = _real_load_latest_checkpoint(conn, simulation_id)
     if state is None:
         return epoch_index, state
     state = copy.deepcopy(state)
-    changed = _process_manual_close_requests(conn, simulation_id, epoch_index, state)
-    if changed:
-        print(f"\n*** venda manual aplicada em memoria (sim={simulation_id}) -- efeito sera' gravado no "
-              f"checkpoint da PROXIMA epoca ({epoch_index + 1}) que fechar de verdade. ***")
+    to_finalize = _process_manual_close_requests(conn, simulation_id, epoch_index, state)
+    if to_finalize:
+        _PENDING_MANUAL_CLOSE_FINALIZATIONS = to_finalize
+        _PENDING_MANUAL_CLOSE_BASE_EPOCH = epoch_index
+        symbols = ", ".join(item["symbol"] for item in to_finalize)
+        print(f"\n*** venda manual aplicada em memoria pra {symbols} (sim={simulation_id}, base=epoca {epoch_index}) "
+              f"-- so' fica DEFINITIVA (experiencia gravada + pedido marcado 'executed') se um checkpoint novo "
+              f"(epoca > {epoch_index}) for realmente escrito NESTA rodada; caso contrario o pedido continua "
+              f"'pending' e e' retentado automaticamente na proxima rodada, sem duplicar nada. ***")
     return epoch_index, state
 
 
 m8run.load_latest_checkpoint = _load_latest_checkpoint_with_manual_closes
+
+
+def _finalize_manual_closes_if_persisted(simulation_id):
+    """MISSAO 21 -- chamada em main() SO' DEPOIS que m8run.run() retorna.
+    Confirma, consultando mission7_checkpoints de novo, se um checkpoint
+    com epoca MAIOR que a base (a epoca que estava vigente quando os
+    fechamentos manuais desta rodada foram aplicados em memoria) foi
+    REALMENTE escrito. So' nesse caso grava mission7_experiences/
+    mission7_risk_breaker_events e marca o pedido 'executed' -- caso
+    contrario nao grava nada, e o pedido continua 'pending' (retentado
+    sozinho na proxima rodada, sem duplicar)."""
+    global _PENDING_MANUAL_CLOSE_FINALIZATIONS, _PENDING_MANUAL_CLOSE_BASE_EPOCH
+    if not _PENDING_MANUAL_CLOSE_FINALIZATIONS:
+        return
+    pending = _PENDING_MANUAL_CLOSE_FINALIZATIONS
+    base_epoch = _PENDING_MANUAL_CLOSE_BASE_EPOCH
+    _PENDING_MANUAL_CLOSE_FINALIZATIONS = []
+    _PENDING_MANUAL_CLOSE_BASE_EPOCH = None
+
+    conn = _cloud_pg_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("select max(epoch_index) from mission7_checkpoints where simulation_id=%s", (simulation_id,))
+            latest_epoch = cur.fetchone()[0]
+        if latest_epoch is None or latest_epoch <= base_epoch:
+            symbols = ", ".join(item["symbol"] for item in pending)
+            print(f"\n[venda manual] NENHUM checkpoint novo foi escrito nesta rodada (ainda na epoca {base_epoch}) -- "
+                  f"pedido(s) de {symbols} continuam 'pending', SEM NADA gravado em mission7_experiences, e serao' "
+                  f"retentados automaticamente na proxima rodada.")
+            return
+        for item in pending:
+            mission7_run.insert_experiences(conn, simulation_id, [item["experience"]])
+            if item["risk_breaker_row"] is not None:
+                mission7_run.insert_rows(conn, "mission7_risk_breaker_events", [item["risk_breaker_row"]], simulation_id)
+            with conn.cursor() as cur:
+                cur.execute(
+                    "update mission7_manual_close_requests set status='executed', executed_at=now(), execution_note=%s where id=%s",
+                    (f"fechado manualmente: preco_saida={item['experience']['exit_price']:.8f}, "
+                     f"pnl_apos_taxas={item['pnl_pct_after_fees']:.2f}%, capital_liquidado_usd={item['trade_alloc_usd']:.2f}. "
+                     f"Confirmado persistido no checkpoint {latest_epoch} (base era {base_epoch}).",
+                     item["request_id"]),
+                )
+            conn.commit()
+            print(f"  [venda manual] {item['symbol']}: pedido #{item['request_id']} EXECUTADO e CONFIRMADO "
+                  f"(checkpoint {latest_epoch} persistiu o fechamento).")
+    finally:
+        conn.close()
 
 
 def _insert_rows_cloud(conn, table, rows, simulation_id):
@@ -537,6 +633,11 @@ def main():
         capital_per_position_usd=CAPITAL_PER_POSITION_USD_LIVE,
         initial_capital_usd=20.0,  # so' usado se nao houver checkpoint algum (nao e' o caso -- checkpoint ja migrado)
     )
+
+    # MISSAO 21 -- SO' AGORA, com m8run.run() ja' totalmente retornado (e
+    # portanto qualquer checkpoint novo desta rodada ja' escrito de
+    # verdade), confirma e finaliza os fechamentos manuais desta rodada.
+    _finalize_manual_closes_if_persisted(SIM_ID)
 
 
 if __name__ == "__main__":
