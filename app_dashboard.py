@@ -61,8 +61,37 @@ from datetime import datetime, timezone
 import streamlit as st  # noqa: E402
 import psycopg2  # noqa: E402
 import psycopg2.extras  # noqa: E402
+import psycopg2.extensions  # noqa: E402
 import pandas as pd  # noqa: E402
 import plotly.graph_objects as go  # noqa: E402
+
+# MISSAO 17 -- correcao de raiz do TypeError na aba Performance & Risco
+# (apareceu so' agora que a epoca 1079 fechou e um 2o checkpoint passou a
+# existir na nuvem, habilitando pela 1a vez o calculo de drawdown_pct).
+# psycopg2, por padrao, devolve qualquer coluna Postgres do tipo NUMERIC
+# (oid 1700) -- inclusive os campos extraidos de jsonb via "::numeric" em
+# load_equity_history, e qualquer coluna "numeric" de verdade em tabelas
+# como mission7_experiences (pnl_percent, entry_price, ...) e
+# mission7_market_states (price, atr_pct, adx) -- como decimal.Decimal,
+# nao como float. Decimal exibe bem (funciona em f-strings), mas NAO
+# aceita operador aritmetico direto com um float literal do Python (ex.:
+# "eq_df['peak_equity'] * 100.0"): "unsupported operand type(s) for *:
+# 'decimal.Decimal' and 'float'" -- exatamente o TypeError da aba
+# Performance & Risco. Em vez de converter coluna por coluna em cada
+# funcao load_* (haveria que lembrar disso em toda query nova), registra-
+# se AQUI, uma unica vez, um typecaster que faz TODA coluna NUMERIC
+# chegar como float nativo em qualquer query feita por este processo --
+# resolve na raiz e cobre tambem qualquer coluna numeric nova que vier a
+# ser lida nas proximas missoes, sem precisar lembrar de nada. So' afeta
+# como ESTE processo do painel (leitura) DESSERIALIZA o resultado das
+# queries -- nao muda nenhum dado gravado no banco, nenhuma escrita, nada
+# do motor (que roda num processo Python totalmente separado, no PC).
+psycopg2.extensions.register_type(
+    psycopg2.extensions.new_type(
+        (1700,), "NUMERIC_AS_FLOAT",
+        lambda value, curs: float(value) if value is not None else None,
+    )
+)
 
 # espelha donchian_engine.py (N_ENTRY_HOURS=480/20d, N_EXIT_HOURS=240/10d)
 # -- valores HARDCODED de proposito (nao importados) pra este dashboard
