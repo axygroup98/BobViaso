@@ -289,6 +289,44 @@ def load_edge_monitor_history(sim_id):
         rows = cur.fetchall()
     return pd.DataFrame(rows, columns=["epoch_index", "simulated_time", "edge_state"])
 @st.cache_data(ttl=15)
+def load_risk_breaker_events(sim_id):
+    """MISSAO 19 -- item critico #3: historico de disjuntores de risco,
+    lido de mission7_risk_breaker_events (tabela ja existente, escrita
+    pelo proprio motor congelado -- SOMENTE LEITURA aqui). Ate' agora
+    invisivel no painel apesar de ja' existir 1 evento real (PEPEUSDT)."""
+    with get_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            "select symbol, epoch_index, threshold_pct, actual_pct, event_sim_time, "
+            "simulation_continued, drawdown_pct_at_event, pause_type, production_behavior "
+            "from mission7_risk_breaker_events where simulation_id=%s order by event_sim_time desc",
+            (sim_id,),
+        )
+        rows = cur.fetchall()
+    cols = ["symbol", "epoch_index", "threshold_pct", "actual_pct", "event_sim_time",
+            "simulation_continued", "drawdown_pct_at_event", "pause_type", "production_behavior"]
+    return pd.DataFrame([dict(r) for r in rows], columns=cols)
+def _price_history_df(state, symbol):
+    """MISSAO 19 -- itens criticos #4/#5/#6: reconstroi a serie de precos
+    usada de VERDADE pelo motor congelado para as decisoes de Donchian,
+    lendo state->price_history->{symbol} (jah carregado 1x por pageview
+    via load_latest_checkpoint_state -- zero query nova). Preferido a
+    mission7_market_states porque essa tabela so' guarda o historico
+    RECENTE pos-migracao pra nuvem (poucas dezenas de candles hoje),
+    enquanto price_history no checkpoint tem a janela completa (485
+    pontos, o suficiente pro canal de entrada de 480h) que o motor usa
+    de fato. Cada elemento e' [open_time_ms, price]. Nunca preenche
+    canais sem dados suficientes (min_periods = janela inteira) -- se
+    nao houver historico suficiente ainda, a banda fica ausente (NaN),
+    nunca fabricada."""
+    hist = (state or {}).get("price_history", {}).get(symbol) or []
+    if not hist:
+        return pd.DataFrame(columns=["open_time", "price", "dt", "donchian_entry_upper", "donchian_exit_lower"])
+    df = pd.DataFrame(hist, columns=["open_time", "price"]).sort_values("open_time").reset_index(drop=True)
+    df["dt"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
+    df["donchian_entry_upper"] = df["price"].rolling(N_ENTRY_HOURS, min_periods=N_ENTRY_HOURS).max()
+    df["donchian_exit_lower"] = df["price"].rolling(N_EXIT_HOURS, min_periods=N_EXIT_HOURS).min()
+    return df
+@st.cache_data(ttl=15)
 def load_bot_control(sim_id):
     with get_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         cur.execute("select * from mission7_bot_control where simulation_id=%s", (sim_id,))
@@ -313,6 +351,24 @@ def _edge_badge(current_state):
     state = (current_state or "—").upper()
     cls = {"NORMAL": "bob-badge-ok", "ATENCAO": "bob-badge-warn", "ATENÇÃO": "bob-badge-warn"}.get(state, "bob-badge-bad" if state not in ("—",) else "bob-badge-neutral")
     return f"<span class='bob-badge {cls}'>{state}</span>"
+def _staleness_badge(simulated_time):
+    """MISSAO 19 -- item critico #2: indicador de idade do dado. Compara
+    o simulated_time do ultimo checkpoint (tempo real/causal, nao
+    inventado) com o relogio real agora -- exatamente o sintoma que
+    causou a investigacao da epoca 1079 travada (dado parado sem
+    nenhum aviso visivel no painel)."""
+    if simulated_time is None:
+        return "<span class='bob-badge bob-badge-neutral'>🕒 idade do dado: sem checkpoint</span>", None
+    st_dt = simulated_time if simulated_time.tzinfo else simulated_time.replace(tzinfo=timezone.utc)
+    age_h = (datetime.now(timezone.utc) - st_dt).total_seconds() / 3600.0
+    if age_h <= 2:
+        cls = "bob-badge-ok"
+    elif age_h <= 6:
+        cls = "bob-badge-warn"
+    else:
+        cls = "bob-badge-bad"
+    label = f"🕒 último checkpoint: há {age_h:.1f}h" if age_h >= 0 else "🕒 último checkpoint: agora"
+    return f"<span class='bob-badge {cls}'>{label}</span>", age_h
 EDGE_STATE_COLOR = {
     "NORMAL": "#2ecc71", "ATENCAO": "#f39c12", "ATENÇÃO": "#f39c12",
     "DEFENSIVO": "#e74c3c", "PAUSA": "#e74c3c", "DESCONHECIDO": "#95a5a6",
@@ -386,9 +442,34 @@ if live is None:
     st.stop()
 epoch_index, simulated_time, state = load_latest_checkpoint_state(LIVE_SIM_ID)
 cap = state.get("capital", {}) if state else {}
-equity_total = (cap.get("available", 0) or 0) + (cap.get("allocated", 0) or 0) + (cap.get("reserved", 0) or 0)
 sizing_state = cap.get("sizing_state", {}) if state else {}
+# MISSAO 19 -- item critico #7: fonte UNICA de capital total pras duas
+# abas (Visao Geral e Performance & Risco) em vez de cada aba calcular
+# o proprio numero a partir de queries/campos diferentes. eq_df (que a
+# aba Performance ja precisava) e' carregado 1x aqui e reusado nas duas
+# -- estruturalmente elimina a divergencia em vez de so' detecta-la.
+# Guarda de reserva: se por algum motivo (corrida entre 2 queries em
+# cache com TTLs vencendo em momentos diferentes) a epoca do checkpoint
+# "state" nao bater com a ultima epoca de eq_df, avisa explicitamente
+# em vez de mostrar 2 numeros diferentes calados.
+eq_df = load_equity_history(LIVE_SIM_ID)
+capital_mismatch = None
+if not eq_df.empty:
+    last_row = eq_df.iloc[-1]
+    equity_total = float(last_row["equity_total"])
+    if epoch_index is not None and int(last_row["epoch_index"]) != int(epoch_index):
+        capital_mismatch = (int(epoch_index), int(last_row["epoch_index"]))
+else:
+    equity_total = (cap.get("available", 0) or 0) + (cap.get("allocated", 0) or 0) + (cap.get("reserved", 0) or 0)
 st.markdown(_status_pill(is_paused), unsafe_allow_html=True)
+staleness_html, staleness_age_h = _staleness_badge(simulated_time)
+st.markdown(staleness_html, unsafe_allow_html=True)
+if capital_mismatch:
+    st.warning(
+        f"⚠️ Época do checkpoint (nº {capital_mismatch[0]}) diverge da última época do histórico de capital "
+        f"(nº {capital_mismatch[1]}) — provavelmente um novo checkpoint chegou entre as duas consultas. "
+        f"Clique em '🔄 Atualizar agora' na barra lateral antes de confiar nos números desta tela."
+    )
 st.write("")
 tab_overview, tab_performance, tab_trades, tab_market = st.tabs(
     ["📊 Visão Geral", "📈 Performance & Risco", "📒 Trades", "💹 Mercado & Donchian"]
@@ -473,6 +554,41 @@ with tab_overview:
                     xaxis=dict(title="P&L não realizado (%)", gridcolor="rgba(255,255,255,0.06)", zeroline=True, zerolinecolor="rgba(255,255,255,0.25)"),
                 )
                 st.plotly_chart(pnl_bar, use_container_width=True)
+            # MISSAO 19 -- item critico #6: distancia ate' o canal de
+            # saida Donchian (10d/240h) por posicao aberta -- usa a
+            # mesma serie price_history do checkpoint (_price_history_df,
+            # ja' documentada acima) que o motor congelado usa de fato
+            # pra decidir a saida. So' mostra a posicao se houver 240h
+            # completas de historico -- nunca fabrica um canal parcial.
+            dist_rows = []
+            for sym in pos_df["símbolo"]:
+                sym_df = _price_history_df(state, sym)
+                if sym_df.empty or pd.isna(sym_df["donchian_exit_lower"].iloc[-1]):
+                    continue
+                last_price = sym_df["price"].iloc[-1]
+                exit_low = sym_df["donchian_exit_lower"].iloc[-1]
+                if last_price:
+                    dist_rows.append({"símbolo": sym, "distância_até_saída_%": round((last_price - exit_low) / last_price * 100.0, 2)})
+            if dist_rows:
+                dist_df = pd.DataFrame(dist_rows).sort_values("distância_até_saída_%")
+                st.markdown("**Distância até o canal de saída Donchian (10d)**")
+                near_exit = dist_df[dist_df["distância_até_saída_%"] <= 5.0]
+                if not near_exit.empty:
+                    st.caption(f"⚠️ {len(near_exit)} posição(ões) a ≤5% do canal de saída (10d): {', '.join(near_exit['símbolo'])}.")
+                dist_bar = go.Figure(go.Bar(
+                    x=dist_df["distância_até_saída_%"], y=dist_df["símbolo"], orientation="h",
+                    marker=dict(color=["#e74c3c" if v <= 5 else ("#f39c12" if v <= 15 else "#2ecc71") for v in dist_df["distância_até_saída_%"]]),
+                    hovertemplate="%{y}: %{x:.2f}% até o canal de saída (10d)<extra></extra>",
+                ))
+                dist_bar.update_layout(**PLOTLY_DARK_LAYOUT)
+                dist_bar.update_layout(
+                    height=260, margin=dict(l=10, r=10, t=10, b=10),
+                    yaxis=dict(autorange="reversed", gridcolor="rgba(255,255,255,0.06)"),
+                    xaxis=dict(title="Distância até o canal de saída (%)", gridcolor="rgba(255,255,255,0.06)"),
+                )
+                st.plotly_chart(dist_bar, use_container_width=True)
+            else:
+                st.caption("Ainda sem 240h de histórico de preço suficiente pra calcular o canal de saída de nenhuma posição aberta.")
             bar = go.Figure(go.Bar(
                 x=pos_df["capital_alocado_usd"], y=pos_df["símbolo"], orientation="h",
                 marker=dict(color="#3498db"),
@@ -492,20 +608,51 @@ with tab_overview:
 # ---------------------------------------------------------------------------
 with tab_performance:
     st.subheader("Curva de Capital e Drawdown")
-    eq_df = load_equity_history(LIVE_SIM_ID)
+    # eq_df ja' foi carregado 1x acima (fonte unica de capital, item
+    # critico #7) -- reusado aqui, nao recarregado de novo.
     if not eq_df.empty and len(eq_df) > 0:
-        # CORRECAO: peak_equity JA vem certo da query acima (o pico de
-        # verdade rastreado internamente pelo motor congelado, dentro de
-        # state->capital->peak_equity) -- NAO recalcular via cummax()
-        # sobre so' as poucas linhas de checkpoint que existem na nuvem
-        # ate' agora. Um cummax() local so' enxerga o que ja' foi migrado
-        # pra' cloud (hoje so' 2 checkpoints), entao ele SUBESTIMA o pico
-        # real sempre que o pico verdadeiro veio de antes da migracao --
-        # e' exatamente o caso agora: pico real ~$117.46, mas as 2 linhas
-        # disponiveis sao ambas ~$108.13, o que faria o cummax() mostrar
-        # 0% de drawdown quando o real e' -7.95% (a so' 2 pontos do
-        # disjuntor de -10%). Usar sempre o peak_equity do motor.
+        # CORRECAO (Missao 17): peak_equity JA vem certo da query acima (o
+        # pico de verdade rastreado internamente pelo motor congelado,
+        # dentro de state->capital->peak_equity) -- NAO recalcular via
+        # cummax() sobre so' as poucas linhas de checkpoint que existem na
+        # nuvem ate' agora. Um cummax() local so' enxerga o que ja' foi
+        # migrado pra' cloud, entao ele SUBESTIMA o pico real sempre que o
+        # pico verdadeiro veio de antes da migracao. Usar sempre o
+        # peak_equity do motor.
         eq_df["drawdown_pct"] = (eq_df["equity_total"] - eq_df["peak_equity"]) / eq_df["peak_equity"] * 100.0
+        current_dd = float(eq_df["drawdown_pct"].iloc[-1])
+        BREAKER_PCT = -10.0  # MAX_CUM_LOSS_PAUSE_PCT em risk_engine.py -- so' leitura/exibicao, nunca alterar aqui.
+        dd1, dd2, dd3 = st.columns(3)
+        dd1.metric("Capital total (fonte única)", f"${equity_total:,.2f}")
+        dd1.caption(f"Época {epoch_index} · pico histórico ${float(eq_df['peak_equity'].iloc[-1]):,.2f}")
+        dd_color = "🟢" if current_dd > -5 else ("🟠" if current_dd > -8 else "🔴")
+        dd2.metric(f"{dd_color} Drawdown atual", f"{current_dd:+.2f}%")
+        dd2.caption(f"Disjuntor de segurança em {BREAKER_PCT:.0f}%")
+        dd3.metric("Distância até o disjuntor", f"{current_dd - BREAKER_PCT:+.2f} p.p.")
+        # MISSAO 19 -- item critico #1: o drawdown_pct sempre foi
+        # calculado aqui em cima, mas nunca era de fato desenhado em
+        # lugar nenhum da tela -- ficava "morto" no dataframe. Este e' o
+        # grafico de verdade, com a linha do disjuntor de -10% marcada.
+        fig_dd = go.Figure()
+        fig_dd.add_trace(go.Scatter(
+            x=eq_df["simulated_time"], y=eq_df["drawdown_pct"],
+            mode="lines+markers", name="Drawdown (%)",
+            line=dict(color="#e74c3c", width=2.5),
+            marker=dict(size=5),
+            fill="tozeroy", fillcolor="rgba(231,76,60,0.12)",
+            hovertemplate="%{x}<br>Drawdown: %{y:.2f}%<extra></extra>",
+        ))
+        fig_dd.add_hline(
+            y=BREAKER_PCT, line_dash="dash", line_color="#e74c3c",
+            annotation_text=f"Disjuntor de segurança ({BREAKER_PCT:.0f}%)",
+            annotation_position="bottom right", annotation_font_color="#e74c3c",
+        )
+        fig_dd.update_layout(**PLOTLY_DARK_LAYOUT)
+        fig_dd.update_layout(
+            height=280, margin=dict(l=10, r=10, t=10, b=10),
+            yaxis=dict(title="Drawdown (%)"), xaxis=dict(title="Tempo Simulado"),
+        )
+        st.plotly_chart(fig_dd, use_container_width=True)
         fig_eq = go.Figure()
         fig_eq.add_trace(go.Scatter(
             x=eq_df["simulated_time"], y=eq_df["equity_total"],
@@ -538,6 +685,28 @@ with tab_performance:
             st.plotly_chart(fig_edge, use_container_width=True)
     else:
         st.info("Aguardando mais checkpoints na nuvem para renderizar a curva de capital.")
+    # MISSAO 19 -- item critico #3: historico de disjuntores de risco
+    # (mission7_risk_breaker_events), ate' agora existente na tabela mas
+    # invisivel no painel -- inclusive o evento real do PEPEUSDT na
+    # epoca 1079 nunca apareceu em lugar nenhum da UI.
+    st.subheader("Histórico de Disjuntores de Risco")
+    breaker_df = load_risk_breaker_events(LIVE_SIM_ID)
+    if not breaker_df.empty:
+        st.warning(f"⚠️ {len(breaker_df)} evento(s) de disjuntor de risco registrado(s) no motor.")
+        show_df = breaker_df.rename(columns={
+            "symbol": "símbolo", "epoch_index": "época", "threshold_pct": "limite_%",
+            "actual_pct": "atual_%", "event_sim_time": "quando (sim.)",
+            "simulation_continued": "simulação continuou", "drawdown_pct_at_event": "drawdown_no_evento_%",
+            "pause_type": "tipo_de_pausa", "production_behavior": "comportamento_em_produção",
+        })
+        st.dataframe(show_df, use_container_width=True)
+        st.caption(
+            "Em produção real (fora do laboratório DRY_RUN), o comportamento configurado é "
+            "'production_behavior' -- aqui em paper trading o motor segue 'research_behavior' "
+            "(isola o ativo e continua o universo), nunca decisão deste painel."
+        )
+    else:
+        st.success("✅ Nenhum disjuntor de risco acionado até o momento.")
 # ---------------------------------------------------------------------------
 # ABA 3 -- Trades Fechados
 # ---------------------------------------------------------------------------
@@ -564,20 +733,49 @@ with tab_market:
     universe = list(state.get("price_history", {}).keys()) if state else []
     if universe:
         selected_sym = st.selectbox("Selecione o ativo", sorted(universe))
-        m_df = load_market_states(LIVE_SIM_ID, selected_sym, limit=500)
+        # MISSAO 19 -- itens criticos #4 e #5: trocado de
+        # load_market_states (so' tem o historico curto pos-migracao pra
+        # nuvem, ~1 dia hoje) pra' _price_history_df, que le' a MESMA
+        # serie que o motor congelado usa de fato pra decidir entrada
+        # (canal de 480h/20d) e saida (canal de 240h/10d) -- ja' carregada
+        # 1x no checkpoint, sem query nova. De quebra corrige o eixo X:
+        # antes usava open_time bruto (milissegundos epoch, ilegivel);
+        # agora usa a coluna 'dt', ja' convertida pra datetime de verdade.
+        m_df = _price_history_df(state, selected_sym)
         if not m_df.empty:
             fig_m = go.Figure()
+            if m_df["donchian_entry_upper"].notna().any():
+                fig_m.add_trace(go.Scatter(
+                    x=m_df["dt"], y=m_df["donchian_entry_upper"],
+                    mode="lines", name=f"Canal de entrada ({N_ENTRY_HOURS}h / 20d)",
+                    line=dict(color="#2ecc71", width=1.3, dash="dot"),
+                    hovertemplate="Canal de entrada: %{y:.8f}<extra></extra>",
+                ))
+            if m_df["donchian_exit_lower"].notna().any():
+                fig_m.add_trace(go.Scatter(
+                    x=m_df["dt"], y=m_df["donchian_exit_lower"],
+                    mode="lines", name=f"Canal de saída ({N_EXIT_HOURS}h / 10d)",
+                    line=dict(color="#e74c3c", width=1.3, dash="dot"),
+                    hovertemplate="Canal de saída: %{y:.8f}<extra></extra>",
+                ))
             fig_m.add_trace(go.Scatter(
-                x=m_df["open_time"], y=m_df["price"],
+                x=m_df["dt"], y=m_df["price"],
                 mode="lines", name=selected_sym,
                 line=dict(color="#3498db", width=2),
+                hovertemplate="%{x}<br>Preço: %{y:.8f}<extra></extra>",
             ))
             fig_m.update_layout(**PLOTLY_DARK_LAYOUT)
             fig_m.update_layout(
-                height=400, margin=dict(l=10, r=10, t=10, b=10),
+                height=420, margin=dict(l=10, r=10, t=10, b=10),
                 yaxis=dict(title="Preço (USDT)"), xaxis=dict(title="Data / Hora (UTC)"),
             )
             st.plotly_chart(fig_m, use_container_width=True)
+            if not m_df["donchian_entry_upper"].notna().any() and not m_df["donchian_exit_lower"].notna().any():
+                st.caption(
+                    f"Ainda sem histórico suficiente ({len(m_df)}h disponíveis) pra desenhar os canais Donchian "
+                    f"completos ({N_EXIT_HOURS}h de saída / {N_ENTRY_HOURS}h de entrada) -- os canais aparecem "
+                    "assim que houver dados suficientes, nunca são estimados com dado parcial."
+                )
         else:
             st.info(f"Sem dados de mercado gravados para {selected_sym}.")
     else:
