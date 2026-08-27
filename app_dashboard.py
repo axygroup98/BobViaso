@@ -373,6 +373,27 @@ EDGE_STATE_COLOR = {
     "NORMAL": "#2ecc71", "ATENCAO": "#f39c12", "ATENÇÃO": "#f39c12",
     "DEFENSIVO": "#e74c3c", "PAUSA": "#e74c3c", "DESCONHECIDO": "#95a5a6",
 }
+def _arrow(v):
+    """MISSAO 20 -- item medio #10: simbolo (nao so' cor) pra ganho/perda,
+    acessivel a quem nao distingue vermelho/verde. Usado em toda barra e
+    tabela que mostra P&L."""
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return "•"
+    return "▲" if v >= 0 else "▼"
+def _highlight_metric_html(label, value_html, sub=None, color="#2ecc71"):
+    """MISSAO 20 -- item medio #11: hierarquia visual mais forte pros
+    numeros mais criticos pra decisao (capital total, drawdown atual) --
+    reusa a mesma linguagem visual de cartao ja' usada em bob-badge/
+    bob-pill, so' com destaque maior (borda colorida + fonte maior)."""
+    sub_html = f"<div style='color:#8b93a7; font-size:0.78rem; margin-top:4px;'>{sub}</div>" if sub else ""
+    return (
+        f"<div style='background:linear-gradient(180deg, rgba(255,255,255,0.05), rgba(255,255,255,0.015));"
+        f"border:1px solid rgba(255,255,255,0.08); border-left:4px solid {color};"
+        f"border-radius:14px; padding:16px 20px; box-shadow:0 4px 18px rgba(0,0,0,0.25);'>"
+        f"<div style='font-size:0.76rem; text-transform:uppercase; letter-spacing:.07em; color:#8b93a7;'>{label}</div>"
+        f"<div style='font-family:\"JetBrains Mono\", monospace; font-weight:800; font-size:2.1rem; color:#f2f4f8; margin-top:2px;'>{value_html}</div>"
+        f"{sub_html}</div>"
+    )
 PLOTLY_DARK_LAYOUT = dict(
     paper_bgcolor="rgba(0,0,0,0)",
     plot_bgcolor="rgba(0,0,0,0)",
@@ -479,7 +500,12 @@ tab_overview, tab_performance, tab_trades, tab_market = st.tabs(
 # ---------------------------------------------------------------------------
 with tab_overview:
     col1, col2, col3, col4, col5 = st.columns(5)
-    col1.metric("Capital total", f"${equity_total:,.2f}")
+    # MISSAO 20 -- item medio #11: capital total e' o numero mais critico
+    # da tela (base de tudo: drawdown, disjuntor, posicoes) -- ganha
+    # destaque visual (borda + fonte maior) em vez de ficar do mesmo
+    # tamanho que "Ultima sincronizacao".
+    with col1:
+        st.markdown(_highlight_metric_html("Capital total", f"${equity_total:,.2f}", color="#2ecc71"), unsafe_allow_html=True)
     col2.metric("PnL realizado", f"${cap.get('realized_pnl', 0):,.2f}")
     col3.metric("Última época", epoch_index if epoch_index is not None else "—")
     col4.metric("Última sincronização", str(simulated_time)[:19] if simulated_time else "—")
@@ -542,9 +568,31 @@ with tab_overview:
                 m3.metric("Pior posição", worst_row["símbolo"], f"{worst_row['p&l_não_realizado_%']:+.1f}%")
                 st.caption("P&L não realizado = variação % entre o preço de entrada e o preço mais recente na nuvem, "
                            "SEM taxas -- só vira lucro/prejuízo de verdade quando a posição fechar de fato.")
+                # MISSAO 20 -- item medio #8: tabela detalhada de posições
+                # (preço entrada/atual, ATR%, capital) -- regressão sinalizada
+                # desde a Missão 17, agora restaurada com formatação de
+                # coluna (dólar/percentual) em vez de números crus.
+                detail_cols = ["símbolo", "preço_entrada", "preço_atual", "p&l_não_realizado_%", "capital_alocado_usd", "atr_pct_na_entrada"]
+                col_config = {
+                    "símbolo": st.column_config.TextColumn("Símbolo"),
+                    "preço_entrada": st.column_config.NumberColumn("Preço entrada", format="%.6g"),
+                    "preço_atual": st.column_config.NumberColumn("Preço atual", format="%.6g"),
+                    "p&l_não_realizado_%": st.column_config.NumberColumn("P&L não realizado (%)", format="%+.2f%%", help="Sem taxas -- só realiza quando a posição fechar."),
+                    "capital_alocado_usd": st.column_config.NumberColumn("Capital alocado", format="dollar"),
+                    "atr_pct_na_entrada": st.column_config.NumberColumn("ATR% na entrada", format="%.2f%%"),
+                }
+                if "% do capital total" in pos_df.columns:
+                    detail_cols.append("% do capital total")
+                    col_config["% do capital total"] = st.column_config.NumberColumn("% do capital total", format="%.2f%%")
+                st.dataframe(pos_df[detail_cols], use_container_width=True, hide_index=True, column_config=col_config)
+                # MISSAO 20 -- item medio #10: simbolo ▲/▼ no rótulo de cada
+                # barra, não só a cor -- acessível a quem não distingue
+                # vermelho/verde.
                 pnl_bar = go.Figure(go.Bar(
                     x=pos_df["p&l_não_realizado_%"], y=pos_df["símbolo"], orientation="h",
                     marker=dict(color=["#2ecc71" if v >= 0 else "#e74c3c" for v in pos_df["p&l_não_realizado_%"].fillna(0)]),
+                    text=[("• sem dado" if pd.isna(v) else f"{_arrow(v)} {v:+.1f}%") for v in pos_df["p&l_não_realizado_%"]],
+                    textposition="outside",
                     hovertemplate="%{y}: %{x:+.2f}%<extra></extra>",
                 ))
                 pnl_bar.update_layout(**PLOTLY_DARK_LAYOUT)
@@ -626,7 +674,12 @@ with tab_performance:
         dd1.metric("Capital total (fonte única)", f"${equity_total:,.2f}")
         dd1.caption(f"Época {epoch_index} · pico histórico ${float(eq_df['peak_equity'].iloc[-1]):,.2f}")
         dd_color = "🟢" if current_dd > -5 else ("🟠" if current_dd > -8 else "🔴")
-        dd2.metric(f"{dd_color} Drawdown atual", f"{current_dd:+.2f}%")
+        dd_hex = "#2ecc71" if current_dd > -5 else ("#f39c12" if current_dd > -8 else "#e74c3c")
+        # MISSAO 20 -- item medio #11: drawdown atual e' o numero que mais
+        # importa pra seguranca (o mais perto do disjuntor de -10%) --
+        # mesmo destaque visual dado ao capital total na Visao Geral.
+        with dd2:
+            st.markdown(_highlight_metric_html(f"{dd_color} Drawdown atual", f"{_arrow(current_dd)} {current_dd:+.2f}%", color=dd_hex), unsafe_allow_html=True)
         dd2.caption(f"Disjuntor de segurança em {BREAKER_PCT:.0f}%")
         dd3.metric("Distância até o disjuntor", f"{current_dd - BREAKER_PCT:+.2f} p.p.")
         # MISSAO 19 -- item critico #1: o drawdown_pct sempre foi
@@ -717,11 +770,46 @@ with tab_trades:
         wins = trades_df[trades_df["pnl_percent"] > 0]
         win_rate = len(wins) / len(trades_df) * 100.0 if len(trades_df) > 0 else 0
 
-        tc1, tc2, tc3 = st.columns(3)
+        # MISSAO 20 -- item medio #9: Fator de lucro = soma dos % positivos
+        # / abs(soma dos % negativos) -- formula padrao da industria
+        # (gross profit / gross loss), conferida contra a definicao usada
+        # por CrossTrade/TradeZella. CAVEAT explicito: mission7_experiences
+        # nao grava o capital alocado por trade fechado, so' pnl_percent --
+        # entao aqui e' um Fator de lucro em BASE %, nao em dolares. Se as
+        # posicoes tiverem tamanhos muito diferentes, pode divergir do
+        # fator em $ de verdade. Nunca escondido -- caption abaixo deixa
+        # isso explicito.
+        gross_profit = trades_df.loc[trades_df["pnl_percent"] > 0, "pnl_percent"].sum()
+        gross_loss = trades_df.loc[trades_df["pnl_percent"] < 0, "pnl_percent"].sum()  # já negativo
+        if gross_loss < 0:
+            profit_factor_label = f"{gross_profit / abs(gross_loss):.2f}"
+        elif gross_profit > 0:
+            profit_factor_label = "∞ (sem perdas)"
+        else:
+            profit_factor_label = "—"
+        tc1, tc2, tc3, tc4 = st.columns(4)
         tc1.metric("Total de trades fechados", len(trades_df))
         tc2.metric("Taxa de acerto (Win Rate)", f"{win_rate:.1f}%")
-        tc3.metric("PnL médio por trade", f"{trades_df['pnl_percent'].mean():+.2f}%")
-        st.dataframe(trades_df, use_container_width=True)
+        tc3.metric("PnL médio por trade", f"{_arrow(trades_df['pnl_percent'].mean())} {trades_df['pnl_percent'].mean():+.2f}%")
+        tc4.metric("Fator de lucro", profit_factor_label, help="Soma dos ganhos % / soma das perdas % (base percentual, não $ -- ver observação abaixo).")
+        st.caption(
+            "Fator de lucro calculado em base **percentual** (soma dos % de trades vencedores dividida pela soma "
+            "absoluta dos % de trades perdedores), porque mission7_experiences não grava o capital alocado por "
+            "trade fechado -- pode divergir do fator de lucro em dólares se as posições tiverem tamanhos muito "
+            "diferentes entre si. Acima de 1.0 = estratégia lucrativa; abaixo de 1.0 = perdedora."
+        )
+        show_trades = trades_df.copy()
+        show_trades.insert(0, "resultado", show_trades["pnl_percent"].map(_arrow))
+        st.dataframe(
+            show_trades, use_container_width=True, hide_index=True,
+            column_config={
+                "resultado": st.column_config.TextColumn("​", width="small"),
+                "pnl_percent": st.column_config.NumberColumn("PnL (%)", format="%+.2f%%"),
+                "entry_price": st.column_config.NumberColumn("Preço entrada", format="%.6g"),
+                "exit_price": st.column_config.NumberColumn("Preço saída", format="%.6g"),
+                "holding_time_hours": st.column_config.NumberColumn("Horas em posição", format="%.1f"),
+            },
+        )
     else:
         st.info("Nenhum trade fechado registrado até o momento. Como o BOB utiliza Donchian (seguidor de tendência), "
                 "as posições vencedoras permanecem abertas enquanto a tendência de alta se mantiver firme.")
@@ -780,6 +868,15 @@ with tab_market:
             st.info(f"Sem dados de mercado gravados para {selected_sym}.")
     else:
         st.info("Universo de ativos indisponível no checkpoint atual.")
+# ---------------------------------------------------------------------------
+# Rodapé -- MISSAO 20 item medio #12: horário de quando o painel foi
+# renderizado (relógio real do servidor, não o simulated_time do bot) --
+# ajuda a distinguir "o painel travou" de "o painel atualizou mas o bot
+# não tem checkpoint novo ainda" (esse 2o caso já fica claro pelo badge
+# de idade do dado no topo, Missão 19 item crítico #2).
+# ---------------------------------------------------------------------------
+st.divider()
+st.caption(f"Última atualização do painel: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC")
 # Auto-refresh logic se ativado
 if auto:
     time.sleep(30)
