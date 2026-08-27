@@ -343,6 +343,47 @@ def set_bot_control(sim_id, paused, reason, updated_by):
         )
         conn.commit()
     st.cache_data.clear()
+# MISSAO 20 -- nova feature "Vender" (fechamento manual/discricionario de
+# uma posicao aberta, a pedido explicito do usuario). O painel NAO tem
+# acesso ao motor/checkpoint (so' roda app_dashboard.py -- ver
+# _bob_cloud_live_step.py), entao NAO fecha nada aqui: so' ENFILEIRA um
+# pedido pendente numa tabela NOVA e dedicada (mission7_manual_close_requests,
+# aditiva, criada so' pra isso -- nenhuma tabela mission7_* original
+# tocada, nenhum checkpoint escrito por este painel). O fechamento de
+# verdade e' aplicado por _bob_cloud_live_step.py rodando no PC, na
+# proxima vez que rodar, reaproveitando _close_position() -- a MESMA
+# funcao que o motor congelado ja usa pras saidas tecnicas (Donchian/
+# stop-ATR) -- ver docstring desse script pra' por que um checkpoint novo
+# nao pode ser inserido direto por aqui (quebraria a relacao causal
+# epoch_index<->tempo). Indice unico parcial na tabela evita pedido
+# duplicado pro mesmo simbolo enquanto houver 1 pendente.
+@st.cache_data(ttl=10)
+def load_manual_close_requests(sim_id, limit=50):
+    with get_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            "select id, symbol, status, requested_at, requested_by, executed_at, execution_note "
+            "from mission7_manual_close_requests where simulation_id=%s "
+            "order by requested_at desc limit %s",
+            (sim_id, limit),
+        )
+        rows = cur.fetchall()
+    cols = ["id", "symbol", "status", "requested_at", "requested_by", "executed_at", "execution_note"]
+    return pd.DataFrame([dict(r) for r in rows], columns=cols)
+def request_manual_close(sim_id, symbol, requested_by="dashboard"):
+    """Enfileira o pedido; devolve True se um pedido NOVO foi criado, False
+    se ja' havia um pedido pendente pra este simbolo (evita duplicar)."""
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            "insert into mission7_manual_close_requests (simulation_id, symbol, status, requested_by) "
+            "values (%s, %s, 'pending', %s) "
+            "on conflict (simulation_id, symbol) where status='pending' do nothing "
+            "returning id",
+            (sim_id, symbol, requested_by),
+        )
+        row = cur.fetchone()
+        conn.commit()
+    st.cache_data.clear()
+    return row is not None
 def _status_pill(is_paused):
     if is_paused:
         return "<span class='bob-pill bob-pill-paused'><span class='bob-pill-dot'></span>PAUSADO</span>"
@@ -492,8 +533,8 @@ if capital_mismatch:
         f"Clique em '🔄 Atualizar agora' na barra lateral antes de confiar nos números desta tela."
     )
 st.write("")
-tab_overview, tab_performance, tab_trades, tab_market = st.tabs(
-    ["📊 Visão Geral", "📈 Performance & Risco", "📒 Trades", "💹 Mercado & Donchian"]
+tab_overview, tab_performance, tab_trades, tab_market, tab_sell = st.tabs(
+    ["📊 Visão Geral", "📈 Performance & Risco", "📒 Trades", "💹 Mercado & Donchian", "🔴 Vender"]
 )
 # ---------------------------------------------------------------------------
 # ABA 1 -- Visão Geral
@@ -868,6 +909,101 @@ with tab_market:
             st.info(f"Sem dados de mercado gravados para {selected_sym}.")
     else:
         st.info("Universo de ativos indisponível no checkpoint atual.")
+# ---------------------------------------------------------------------------
+# ABA 5 -- Vender (fechamento manual/discricionário)
+# ---------------------------------------------------------------------------
+with tab_sell:
+    st.subheader("🔴 Venda manual (fechamento discricionário)")
+    st.caption(
+        "Fecha uma posição aberta ANTES do critério técnico do motor (saída Donchian de 10d ou stop de 2×ATR). "
+        "Isso quebra a disciplina 100% sistemática do BOB para aquele símbolo -- use com cautela (posições "
+        "vencedoras às vezes continuam subindo por muito tempo antes de sair pelo critério técnico). O pedido "
+        "fica pendente aqui e é executado pelo robô local (_bob_cloud_live_step.py) na próxima vez que ele "
+        "rodar -- o motor congelado (entrada/saída/stop/disjuntor) nunca é alterado, ele só reaproveita a "
+        "mesma função de fechamento (_close_position) que já usa pras saídas técnicas."
+    )
+    positions_now = state.get("positions", {}) if state else {}
+    open_now = {sym: p for sym, p in positions_now.items() if p.get("in_position")}
+    if not open_now:
+        st.info("Nenhuma posição aberta no momento pra vender.")
+    else:
+        current_prices_sell = load_current_prices(LIVE_SIM_ID, list(open_now.keys()))
+        sell_rows = []
+        for sym, p in open_now.items():
+            entry = p.get("entry_price")
+            atual = current_prices_sell.get(sym)
+            pnl = ((atual - entry) / entry * 100.0) if (entry and atual is not None) else None
+            sell_rows.append({
+                "símbolo": sym, "preço_entrada": entry, "preço_atual": atual,
+                "p&l_não_realizado_%": round(pnl, 2) if pnl is not None else None,
+                "capital_alocado_usd": p.get("allocated_capital_usd"),
+            })
+        sell_df = pd.DataFrame(sell_rows).sort_values("símbolo").reset_index(drop=True)
+        st.dataframe(
+            sell_df, use_container_width=True, hide_index=True,
+            column_config={
+                "símbolo": st.column_config.TextColumn("Símbolo"),
+                "preço_entrada": st.column_config.NumberColumn("Preço entrada", format="%.6g"),
+                "preço_atual": st.column_config.NumberColumn("Preço atual", format="%.6g"),
+                "p&l_não_realizado_%": st.column_config.NumberColumn("P&L não realizado (%)", format="%+.2f%%"),
+                "capital_alocado_usd": st.column_config.NumberColumn("Capital alocado", format="dollar"),
+            },
+        )
+        pending_df_now = load_manual_close_requests(LIVE_SIM_ID)
+        pending_symbols = set(pending_df_now.loc[pending_df_now["status"] == "pending", "symbol"]) if not pending_df_now.empty else set()
+        sellable_symbols = [s for s in sell_df["símbolo"] if s not in pending_symbols]
+        if pending_symbols:
+            st.caption(f"Já com pedido pendente (não aparecem na lista pra vender abaixo): {', '.join(sorted(pending_symbols))}.")
+        st.write("")
+        if "sell_armed_symbol" not in st.session_state:
+            st.session_state.sell_armed_symbol = None
+        if not sellable_symbols:
+            st.caption("Todas as posições abertas já têm um pedido de venda manual pendente.")
+        else:
+            chosen = st.selectbox("Símbolo para vender", options=sellable_symbols)
+            if st.session_state.sell_armed_symbol != chosen:
+                if st.button(f"🔴 Vender {chosen} agora", type="primary"):
+                    st.session_state.sell_armed_symbol = chosen
+                    st.rerun()
+            else:
+                row_sel = sell_df[sell_df["símbolo"] == chosen].iloc[0]
+                pnl_val = row_sel["p&l_não_realizado_%"]
+                pnl_label = "sem dado" if pd.isna(pnl_val) else f"{pnl_val:+.2f}%"
+                st.warning(
+                    f"Confirma o fechamento MANUAL de {chosen}? Preço de entrada ${row_sel['preço_entrada']:.6g}, "
+                    f"preço atual ${row_sel['preço_atual']:.6g} ({pnl_label}). Isso encerra a posição na próxima "
+                    "execução do robô local, fora do critério técnico do motor."
+                )
+                c1, c2 = st.columns(2)
+                if c1.button("CONFIRMAR VENDA", type="primary", use_container_width=True):
+                    created = request_manual_close(LIVE_SIM_ID, chosen, requested_by="dashboard")
+                    st.session_state.sell_armed_symbol = None
+                    if created:
+                        st.success(f"Pedido de venda manual de {chosen} enfileirado -- será executado na próxima rodada do robô local.")
+                    else:
+                        st.info(f"Já existia um pedido pendente pra {chosen} -- nenhum pedido duplicado foi criado.")
+                    st.rerun()
+                if c2.button("Cancelar", use_container_width=True):
+                    st.session_state.sell_armed_symbol = None
+                    st.rerun()
+    st.divider()
+    st.markdown("**Histórico de pedidos de venda manual**")
+    hist_df = load_manual_close_requests(LIVE_SIM_ID, limit=50)
+    if hist_df.empty:
+        st.caption("Nenhum pedido de venda manual foi feito ainda.")
+    else:
+        st.dataframe(
+            hist_df, use_container_width=True, hide_index=True,
+            column_config={
+                "id": None,
+                "symbol": st.column_config.TextColumn("Símbolo"),
+                "status": st.column_config.TextColumn("Status"),
+                "requested_at": st.column_config.DatetimeColumn("Pedido em", format="YYYY-MM-DD HH:mm:ss"),
+                "requested_by": st.column_config.TextColumn("Pedido por"),
+                "executed_at": st.column_config.DatetimeColumn("Executado em", format="YYYY-MM-DD HH:mm:ss"),
+                "execution_note": st.column_config.TextColumn("Nota de execução"),
+            },
+        )
 # ---------------------------------------------------------------------------
 # Rodapé -- MISSAO 20 item medio #12: horário de quando o painel foi
 # renderizado (relógio real do servidor, não o simulated_time do bot) --
