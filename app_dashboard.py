@@ -88,9 +88,19 @@ def _minimal_cloud_safety_check(cfg):
         st.error("BLOQUEADO: DRY_RUN precisa ser 'true' -- nunca deve rodar sem isso.")
         st.stop()
 def load_cloud_config():
-    local_env_path = r"C:\Users\junio\BOT_LAB\config\.env.cloud"
+    # Caminho local generico (funciona pra qualquer usuario/maquina, nao
+    # so pra uma pasta pessoal especifica) -- pode ser sobrescrito via
+    # env var BOB_LOCAL_CONFIG_DIR se o BOT_LAB estiver em outro lugar.
+    # No Streamlit Cloud esse caminho simplesmente nao existe, entao cai
+    # no fallback de st.secrets logo abaixo -- comportamento identico ao
+    # de antes, so sem expor a estrutura de pasta local no repo publico.
+    local_config_dir = os.environ.get(
+        "BOB_LOCAL_CONFIG_DIR",
+        os.path.join(os.path.expanduser("~"), "BOT_LAB", "config"),
+    )
+    local_env_path = os.path.join(local_config_dir, ".env.cloud")
     if os.path.exists(local_env_path):
-        sys.path.insert(0, r"C:\Users\junio\BOT_LAB\config")
+        sys.path.insert(0, local_config_dir)
         from environment_guard import load_env_file, assert_cloud_paper_live_safe  # noqa: E402
         cfg = load_env_file(local_env_path)
         assert_cloud_paper_live_safe(cfg)
