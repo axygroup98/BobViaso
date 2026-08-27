@@ -3,24 +3,20 @@
 MISSAO 12 -- Painel Espelho (dashboard Streamlit) do BOB, SOMENTE LEITURA
 pros dados de operacao + 1 UNICA acao de escrita controlada (o kill
 switch, numa tabela nova e dedicada pra isso -- mission7_bot_control).
-
 NAO importa nem chama run_one_epoch/run() nem qualquer parte do motor de
 decisao -- este painel NUNCA decide nada de trading, so' EXIBE o que o
 motor (rodando via _bob_cloud_live_step.py) ja decidiu, e permite pausar
 NOVAS entradas via flag (ver docstring de _bob_cloud_live_step.py pra'
 como a flag e' aplicada -- so' no sizing_fn, o motor de entrada/saida/
 stop/disjuntor nunca e' tocado).
-
 MISSAO 13 -- PORTATIL (roda local no PC OU no Streamlit Community Cloud,
 mesmo arquivo, sem duplicar). Conecta SEMPRE no mesmo projeto Supabase
 dedicado "bob-paper-live" (dutmxvqluuxfexbdfbxm) -- NUNCA outro host.
-
 MISSAO 14 -- VISUAL/UX profissional: so' CAMADA DE APRESENTACAO (CSS,
 layout em abas, graficos extras calculados a partir dos MESMOS dados ja
 carregados pelas funcoes de leitura abaixo). Nenhuma query nova de
 escrita, nenhuma tabela nova, nenhuma dependencia nova alem do que ja
 estava em requirements.txt (plotly ja cobre donut/barra/area).
-
 MISSAO 15 -- Estatisticas de trades (taxa de acerto, fator de lucro) lidas
 de mission7_experiences (tabela ja existente, escrita pelo proprio motor
 via mission7_run.insert_experiences/apply_resolved -- SOMENTE LEITURA
@@ -28,11 +24,24 @@ aqui, nenhuma escrita nova) + historico do monitor de edge por epoca
 (mesmo jsonb de checkpoints ja usado na curva de capital). Enquanto nao
 houver trades fechados/checkpoints suficientes na nuvem, o painel mostra
 isso com clareza -- nunca inventa numero.
-
+MISSAO 18 -- P&L NAO REALIZADO das posicoes abertas (aba Visao Geral).
+Motivacao: com o Donchian sendo trend-following (so' sai no rompimento da
+minima de 10d), posicoes ficam abertas por semanas enquanto a tendencia
+segura -- e o painel so' mostrava trades FECHADOS (mission7_experiences,
+Missao 15), que ainda estava vazio. Isso dava a impressao de "nada
+mudando", quando na verdade as posicoes abertas estavam com ganho de
+verdade (conferido manualmente: todas as 10 posicoes abertas em
+2026-08-27 estavam no lucro, de +9% a +370%). A correcao NAO fecha nada
+nem toca no motor -- so' compara entry_price (ja gravado no checkpoint)
+com o preco mais recente (ja gravado em mission7_market_states) e mostra
+a diferenca percentual. Deixa claro na tela que e' "nao realizado" (so'
+vira ganho/perda de verdade quando a posicao fechar via saida Donchian/
+stop ATR/disjuntor) -- nunca disfarça isso de trade fechado.
 COMO A CONFIGURACAO E' CARREGADA (2 caminhos, auto-detectados):
   1. LOCAL (no PC do laboratorio): le' .env.cloud e usa o guard COMPLETO
      ja existente (environment_guard.assert_cloud_paper_live_safe) --
      REUSO direto, nao duplicado, mesma validacao de sempre.
+
   2. NUVEM (Streamlit Community Cloud): environment_guard.py NUNCA e'
      publicado num repositorio (ele contem uma lista de hosts de
      PRODUCAO REAL proibidos que jamais deveria ir pro GitHub, nem
@@ -41,15 +50,6 @@ COMO A CONFIGURACAO E' CARREGADA (2 caminhos, auto-detectados):
      commitada) e passa por uma checagem MINIMA e AUTOCONTIDA aqui mesmo
      (so' confere host==projeto autorizado e DRY_RUN=true) -- fail closed
      igual ao guard original, so' que sem carregar o arquivo sensivel.
-
-Uso local:
-  pip install streamlit psycopg2-binary pandas plotly
-  streamlit run app_dashboard.py
-
-Deploy: ver instrucoes de Missao 13 (GitHub + Streamlit Community Cloud).
-Host de nuvem: aceita tanto o host direto do Supabase quanto o pooler
-Supavisor (ver ALLOWED_CLOUD_HOSTS) -- o pooler e' o que de fato funciona
-a partir do Streamlit Community Cloud (rede sem saida IPv6).
 """
 import sys
 import os
@@ -57,63 +57,29 @@ import time
 import json
 from contextlib import contextmanager
 from datetime import datetime, timezone
-
 import streamlit as st  # noqa: E402
 import psycopg2  # noqa: E402
 import psycopg2.extras  # noqa: E402
 import psycopg2.extensions  # noqa: E402
 import pandas as pd  # noqa: E402
 import plotly.graph_objects as go  # noqa: E402
-
 # MISSAO 17 -- correcao de raiz do TypeError na aba Performance & Risco
 # (apareceu so' agora que a epoca 1079 fechou e um 2o checkpoint passou a
 # existir na nuvem, habilitando pela 1a vez o calculo de drawdown_pct).
-# psycopg2, por padrao, devolve qualquer coluna Postgres do tipo NUMERIC
-# (oid 1700) -- inclusive os campos extraidos de jsonb via "::numeric" em
-# load_equity_history, e qualquer coluna "numeric" de verdade em tabelas
-# como mission7_experiences (pnl_percent, entry_price, ...) e
-# mission7_market_states (price, atr_pct, adx) -- como decimal.Decimal,
-# nao como float. Decimal exibe bem (funciona em f-strings), mas NAO
-# aceita operador aritmetico direto com um float literal do Python (ex.:
-# "eq_df['peak_equity'] * 100.0"): "unsupported operand type(s) for *:
-# 'decimal.Decimal' and 'float'" -- exatamente o TypeError da aba
-# Performance & Risco. Em vez de converter coluna por coluna em cada
-# funcao load_* (haveria que lembrar disso em toda query nova), registra-
-# se AQUI, uma unica vez, um typecaster que faz TODA coluna NUMERIC
-# chegar como float nativo em qualquer query feita por este processo --
-# resolve na raiz e cobre tambem qualquer coluna numeric nova que vier a
-# ser lida nas proximas missoes, sem precisar lembrar de nada. So' afeta
-# como ESTE processo do painel (leitura) DESSERIALIZA o resultado das
-# queries -- nao muda nenhum dado gravado no banco, nenhuma escrita, nada
-# do motor (que roda num processo Python totalmente separado, no PC).
 psycopg2.extensions.register_type(
     psycopg2.extensions.new_type(
         (1700,), "NUMERIC_AS_FLOAT",
         lambda value, curs: float(value) if value is not None else None,
     )
 )
-
-# espelha donchian_engine.py (N_ENTRY_HOURS=480/20d, N_EXIT_HOURS=240/10d)
-# -- valores HARDCODED de proposito (nao importados) pra este dashboard
-# nao depender de nenhum arquivo do motor -- o repositorio de deploy fica
-# so' com este arquivo + requirements.txt, nada do "lab/engine" precisa
-# ser publicado. Sao so' constantes de VISUALIZACAO (o motor de verdade,
-# que decide de fato, roda no PC/via _bob_cloud_live_step.py e nunca le'
-# nada daqui). Se donchian_engine.py mudar essas constantes um dia (o que
-# quebraria o hash congelado -- exigiria decisao explicita), atualizar
-# aqui tambem.
 N_ENTRY_HOURS = 480
 N_EXIT_HOURS = 240
-
 ALLOWED_CLOUD_HOSTS = {
-    "db.dutmxvqluuxfexbdfbxm.supabase.co",   # conexao direta (IPv6 -- pode falhar em redes sem saida IPv6, ex. Streamlit Cloud)
-    "aws-0-sa-east-1.pooler.supabase.com",   # Supavisor pooler (IPv4-compativel), mesmo projeto "bob-paper-live"
-}  # ambos SEMPRE do mesmo projeto dedicado "bob-paper-live" (dutmxvqluuxfexbdfbxm) -- nunca outro projeto/host
-
-
+    "db.dutmxvqluuxfexbdfbxm.supabase.co",    # conexao direta
+    "aws-0-sa-east-1.pooler.supabase.com",    # Supavisor pooler (IPv4-compativel)
+}
 def _minimal_cloud_safety_check(cfg):
-    """Checagem FAIL CLOSED, autocontida (sem importar environment_guard.py
-    -- ver docstring do topo). So' usada no caminho Streamlit Cloud."""
+    """Checagem FAIL CLOSED, autocontida para o Streamlit Cloud."""
     host = str(cfg.get("DB_HOST", "")).strip().lower()
     if host not in ALLOWED_CLOUD_HOSTS:
         st.error(f"BLOQUEADO: DB_HOST='{host}' nao e' um host autorizado do projeto Supabase 'bob-paper-live' ({sorted(ALLOWED_CLOUD_HOSTS)}).")
@@ -121,20 +87,14 @@ def _minimal_cloud_safety_check(cfg):
     if str(cfg.get("DRY_RUN", "")).strip().lower() != "true":
         st.error("BLOQUEADO: DRY_RUN precisa ser 'true' -- nunca deve rodar sem isso.")
         st.stop()
-
-
 def load_cloud_config():
-    """Caminho 1 (local): .env.cloud + guard completo, reusado sem
-    alteracao. Caminho 2 (Streamlit Cloud): st.secrets + checagem minima
-    acima. Detecta automaticamente qual esta' disponivel."""
     local_env_path = r"C:\Users\junio\BOT_LAB\config\.env.cloud"
     if os.path.exists(local_env_path):
         sys.path.insert(0, r"C:\Users\junio\BOT_LAB\config")
         from environment_guard import load_env_file, assert_cloud_paper_live_safe  # noqa: E402
         cfg = load_env_file(local_env_path)
-        assert_cloud_paper_live_safe(cfg)  # guard completo, mesmo de sempre
+        assert_cloud_paper_live_safe(cfg)
         return cfg
-    # sem o arquivo local -> assume Streamlit Community Cloud (st.secrets)
     try:
         cfg = dict(st.secrets)
     except Exception:
@@ -143,42 +103,30 @@ def load_cloud_config():
         return {}
     _minimal_cloud_safety_check(cfg)
     return cfg
-
-
-cloud_cfg = load_cloud_config()  # PRIMEIRA validacao real, antes de qualquer conexao.
-
+cloud_cfg = load_cloud_config()
 SIM_IDS = {
     "MISSION10_BOB_PAPER_LIVE_20USD_001": "Missao 10 -- Paper trading AO VIVO (ativo)",
     "MISSION9_BOB_BOB_EDGE_MILD_RECAL_20USD_001": "Missao 9 -- Congelada (referencia)",
 }
 LIVE_SIM_ID = "MISSION10_BOB_PAPER_LIVE_20USD_001"
-
 st.set_page_config(page_title="BOB -- Painel Espelho", page_icon="📈", layout="wide")
-
-
 # ---------------------------------------------------------------------------
-# MISSAO 14 -- estilo visual (so' CSS/HTML, nao mexe em nenhum dado/logica)
+# MISSAO 14 -- Estilo Visual Profissional (CSS Avançado)
 # ---------------------------------------------------------------------------
 def _inject_custom_css():
     st.markdown("""
     <style>
     @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500;600;700&display=swap');
-
     html, body, [class*="css"], .stApp { font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif; }
-
     .stApp {
         background: radial-gradient(circle at 12% 0%, #131a2b 0%, #0b0f1a 45%, #07080d 100%);
     }
-
     section[data-testid="stSidebar"] {
         background: #0d1120;
         border-right: 1px solid rgba(255,255,255,0.06);
     }
     section[data-testid="stSidebar"] * { font-family: 'Inter', sans-serif; }
-
     #MainMenu, footer, header[data-testid="stHeader"] { background: transparent; }
-
-    /* cards de metrica */
     div[data-testid="stMetric"] {
         background: linear-gradient(180deg, rgba(255,255,255,0.045), rgba(255,255,255,0.015));
         border: 1px solid rgba(255,255,255,0.08);
@@ -188,12 +136,8 @@ def _inject_custom_css():
     }
     div[data-testid="stMetricLabel"] { font-size: 0.74rem; text-transform: uppercase; letter-spacing: .07em; color: #8b93a7 !important; }
     div[data-testid="stMetricValue"] { font-family: 'JetBrains Mono', monospace; font-weight: 700; font-size: 1.5rem !important; }
-
     h1, h2, h3 { font-weight: 800 !important; letter-spacing: -0.02em; }
-
     hr, div[data-testid="stDivider"] { border-color: rgba(255,255,255,0.08) !important; }
-
-    /* pilula de status */
     .bob-pill {
         display: inline-flex; align-items: center; gap: 9px;
         padding: 7px 16px; border-radius: 999px; font-weight: 700; font-size: 0.88rem;
@@ -205,45 +149,23 @@ def _inject_custom_css():
     .bob-pill-paused { background: rgba(231, 76, 60, 0.12); color: #e74c3c; border: 1px solid rgba(231,76,60,0.35); }
     .bob-pill-paused .bob-pill-dot { background: #e74c3c; }
     @keyframes bobpulse { 0% {opacity:1;} 50% {opacity:.35;} 100% {opacity:1;} }
-
-    /* badge pequeno (estado do monitor de edge, etc.) */
     .bob-badge { display:inline-block; padding: 3px 11px; border-radius: 999px; font-size: 0.78rem; font-weight: 700; letter-spacing:.02em; }
     .bob-badge-ok { background: rgba(46,204,113,0.14); color:#2ecc71; border:1px solid rgba(46,204,113,0.3); }
     .bob-badge-warn { background: rgba(243,156,18,0.14); color:#f39c12; border:1px solid rgba(243,156,18,0.3); }
     .bob-badge-bad { background: rgba(231,76,60,0.14); color:#e74c3c; border:1px solid rgba(231,76,60,0.3); }
     .bob-badge-neutral { background: rgba(149,165,166,0.14); color:#95a5a6; border:1px solid rgba(149,165,166,0.3); }
-
-    /* cabecalho */
     .bob-header { display:flex; align-items:center; gap:16px; margin-bottom: 6px; }
     .bob-header-title { font-size: 1.65rem; font-weight: 800; letter-spacing:-0.02em; color:#f2f4f8; }
     .bob-header-sub { color:#8b93a7; font-size: 0.85rem; margin-top: 2px; }
-
-    /* tabelas */
     div[data-testid="stDataFrame"] { border-radius: 12px; overflow: hidden; border: 1px solid rgba(255,255,255,0.08); }
-
-    /* botoes */
     .stButton>button { border-radius: 10px; font-weight: 700; border: none; }
-
-    /* abas */
     button[data-baseweb="tab"] { font-weight: 700; font-size: 0.92rem; }
     div[data-baseweb="tab-highlight"] { background-color: #2ecc71 !important; }
-
-    /* caption */
     .stCaption, [data-testid="stCaptionContainer"] { color: #6f7891 !important; }
     </style>
     """, unsafe_allow_html=True)
-
-
 _inject_custom_css()
-
-
 def _require_passcode():
-    """MISSAO 13 -- gate de senha. O Streamlit Community Cloud gratuito so'
-    oferece deploy PUBLICO (privado exige trial pago via Snowflake) -- ou
-    seja, qualquer pessoa com o link acessaria o kill switch se nada
-    barrasse isso. So' entra em vigor quando DASHBOARD_PASSCODE existe na
-    config (ou seja, so' na nuvem, definido nas Secrets do Streamlit Cloud
-    -- o uso LOCAL no PC continua sem pedir nada, sem fricção)."""
     expected = cloud_cfg.get("DASHBOARD_PASSCODE")
     if not expected:
         return
@@ -266,18 +188,9 @@ def _require_passcode():
             else:
                 st.error("Senha incorreta.")
     st.stop()
-
-
 _require_passcode()
-
-
 @contextmanager
 def get_conn():
-    """Conexao NOVA por chamada (mais simples/robusto num painel Streamlit
-    do que manter 1 conexao viva entre reruns -- evita conexao expirada
-    apos idle), SEMPRE fechada no final (with ... as conn so' cuida da
-    transacao, nao fecha sozinho -- por isso o try/finally explicito
-    aqui). Sempre pro projeto de nuvem ja validado acima."""
     conn = psycopg2.connect(
         host=cloud_cfg["DB_HOST"], port=cloud_cfg.get("DB_PORT", 5432),
         user=cloud_cfg["DB_USER"], password=cloud_cfg["DB_PASSWORD"], dbname=cloud_cfg["DB_NAME"],
@@ -286,8 +199,6 @@ def get_conn():
         yield conn
     finally:
         conn.close()
-
-
 @st.cache_data(ttl=15)
 def load_simulations():
     with get_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
@@ -297,8 +208,6 @@ def load_simulations():
             (list(SIM_IDS.keys()),),
         )
         return {r["simulation_id"]: dict(r) for r in cur.fetchall()}
-
-
 @st.cache_data(ttl=15)
 def load_latest_checkpoint_state(sim_id):
     with get_conn() as conn, conn.cursor() as cur:
@@ -314,8 +223,6 @@ def load_latest_checkpoint_state(sim_id):
         if isinstance(state, str):
             state = json.loads(state)
         return epoch_index, simulated_time, state
-
-
 @st.cache_data(ttl=15)
 def load_equity_history(sim_id):
     with get_conn() as conn, conn.cursor() as cur:
@@ -335,8 +242,6 @@ def load_equity_history(sim_id):
         if not df.empty:
             df["equity_total"] = df["available"] + df["allocated"] + df["reserved"]
         return df
-
-
 @st.cache_data(ttl=15)
 def load_market_states(sim_id, symbol, limit=1000):
     with get_conn() as conn, conn.cursor() as cur:
@@ -348,17 +253,21 @@ def load_market_states(sim_id, symbol, limit=1000):
         rows = cur.fetchall()
     df = pd.DataFrame(rows, columns=["open_time", "ts", "price"]).sort_values("open_time")
     return df
-
-
+@st.cache_data(ttl=15)
+def load_current_prices(sim_id, symbols):
+    """MISSAO 18 -- Preço mais recente para cálculo do P&L não realizado."""
+    if not symbols:
+        return {}
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            "select distinct on (symbol) symbol, price from mission7_market_states "
+            "where simulation_id=%s and symbol = any(%s) order by symbol, open_time desc",
+            (sim_id, list(symbols)),
+        )
+        rows = cur.fetchall()
+    return {sym: price for sym, price in rows}
 @st.cache_data(ttl=15)
 def load_trade_stats(sim_id):
-    """MISSAO 15 -- estatisticas de trades RESOLVIDOS (ja fechados), lidas
-    direto de mission7_experiences (tabela ja existente, escrita pelo
-    proprio motor via mission7_run.insert_experiences/apply_resolved --
-    NENHUMA query nova de escrita, so' leitura). Enquanto nao houver trades
-    fechados na nuvem (normal logo apos uma migracao enxuta, ou quando
-    ainda nao passou tempo real suficiente pra' fechar uma epoca), volta
-    vazio -- o painel mostra isso com clareza, nunca inventa numero."""
     with get_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         cur.execute(
             "select symbol, epoch_index, entry_price, exit_price, pnl_percent, holding_time_hours, "
@@ -368,14 +277,8 @@ def load_trade_stats(sim_id):
         )
         rows = cur.fetchall()
     return pd.DataFrame(rows, columns=["symbol", "epoch_index", "entry_price", "exit_price", "pnl_percent", "holding_time_hours", "resolution_sim_time"])
-
-
 @st.cache_data(ttl=15)
 def load_edge_monitor_history(sim_id):
-    """Historico do estado do monitor de edge (NORMAL/ATENCAO/...) por
-    epoca, extraido do mesmo jsonb de checkpoints ja usado em
-    load_equity_history -- so' mais um campo do mesmo state, sem query
-    nova de escrita."""
     with get_conn() as conn, conn.cursor() as cur:
         cur.execute(
             "select epoch_index, simulated_time, "
@@ -385,16 +288,12 @@ def load_edge_monitor_history(sim_id):
         )
         rows = cur.fetchall()
     return pd.DataFrame(rows, columns=["epoch_index", "simulated_time", "edge_state"])
-
-
 @st.cache_data(ttl=15)
 def load_bot_control(sim_id):
     with get_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         cur.execute("select * from mission7_bot_control where simulation_id=%s", (sim_id,))
         row = cur.fetchone()
         return dict(row) if row else {"simulation_id": sim_id, "paused": False, "paused_reason": None, "updated_at": None, "updated_by": None}
-
-
 def set_bot_control(sim_id, paused, reason, updated_by):
     with get_conn() as conn, conn.cursor() as cur:
         cur.execute(
@@ -406,25 +305,18 @@ def set_bot_control(sim_id, paused, reason, updated_by):
         )
         conn.commit()
     st.cache_data.clear()
-
-
-# ---------------------------------------------------------------------------
-# MISSAO 14 -- pequenos helpers de apresentacao (HTML/CSS puro, sem logica de negocio)
-# ---------------------------------------------------------------------------
 def _status_pill(is_paused):
     if is_paused:
         return "<span class='bob-pill bob-pill-paused'><span class='bob-pill-dot'></span>PAUSADO</span>"
     return "<span class='bob-pill bob-pill-live'><span class='bob-pill-dot'></span>ATIVO</span>"
-
-
 def _edge_badge(current_state):
     state = (current_state or "—").upper()
     cls = {"NORMAL": "bob-badge-ok", "ATENCAO": "bob-badge-warn", "ATENÇÃO": "bob-badge-warn"}.get(state, "bob-badge-bad" if state not in ("—",) else "bob-badge-neutral")
     return f"<span class='bob-badge {cls}'>{state}</span>"
-
-
-EDGE_STATE_COLOR = {"NORMAL": "#2ecc71", "ATENCAO": "#f39c12", "DEFENSIVO": "#e74c3c", "PAUSA": "#e74c3c", "DESCONHECIDO": "#95a5a6"}
-
+EDGE_STATE_COLOR = {
+    "NORMAL": "#2ecc71", "ATENCAO": "#f39c12", "ATENÇÃO": "#f39c12",
+    "DEFENSIVO": "#e74c3c", "PAUSA": "#e74c3c", "DESCONHECIDO": "#95a5a6",
+}
 PLOTLY_DARK_LAYOUT = dict(
     paper_bgcolor="rgba(0,0,0,0)",
     plot_bgcolor="rgba(0,0,0,0)",
@@ -433,9 +325,8 @@ PLOTLY_DARK_LAYOUT = dict(
     xaxis=dict(gridcolor="rgba(255,255,255,0.06)", zeroline=False),
     yaxis=dict(gridcolor="rgba(255,255,255,0.06)", zeroline=False),
 )
-
 # ---------------------------------------------------------------------------
-# Sidebar -- kill switch + controles
+# Sidebar -- Kill Switch & Controles
 # ---------------------------------------------------------------------------
 st.sidebar.markdown(
     "<div style='display:flex;align-items:center;gap:10px;margin-bottom:2px;'>"
@@ -445,10 +336,8 @@ st.sidebar.markdown(
 )
 st.sidebar.caption("Projeto Supabase: bob-paper-live (dutmxvqluuxfexbdfbxm)")
 st.sidebar.divider()
-
 ctrl = load_bot_control(LIVE_SIM_ID)
 is_paused = bool(ctrl.get("paused"))
-
 if is_paused:
     st.sidebar.error(f"🛑 PAUSADO desde {ctrl.get('updated_at')}\nMotivo: {ctrl.get('paused_reason') or '(nao informado)'}")
     if st.sidebar.button("✅ RETOMAR novas entradas", use_container_width=True):
@@ -464,7 +353,7 @@ else:
             st.rerun()
     else:
         st.sidebar.warning("Tem certeza? Isso bloqueia NOVAS entradas a partir do proximo step. "
-                            "Posicoes ja abertas continuam sendo geridas normalmente (saida/stop/disjuntor intocados).")
+                           "Posicoes ja abertas continuam sendo geridas normalmente.")
         reason = st.sidebar.text_input("Motivo (opcional)", key="pause_reason")
         c1, c2 = st.sidebar.columns(2)
         if c1.button("CONFIRMAR PAUSA", type="primary", use_container_width=True):
@@ -474,15 +363,13 @@ else:
         if c2.button("Cancelar", use_container_width=True):
             st.session_state.armed = False
             st.rerun()
-
 st.sidebar.divider()
 if st.sidebar.button("🔄 Atualizar agora", use_container_width=True):
     st.cache_data.clear()
     st.rerun()
 auto = st.sidebar.checkbox("Auto-atualizar a cada 30s")
-
 # ---------------------------------------------------------------------------
-# Corpo principal
+# Corpo Principal
 # ---------------------------------------------------------------------------
 st.markdown(
     "<div class='bob-header'>"
@@ -492,26 +379,20 @@ st.markdown(
     "</div>",
     unsafe_allow_html=True,
 )
-
 sims = load_simulations()
 live = sims.get(LIVE_SIM_ID)
-
 if live is None:
     st.error(f"Simulacao {LIVE_SIM_ID} nao encontrada no Supabase -- rode a migracao (Missao 11) primeiro.")
     st.stop()
-
 epoch_index, simulated_time, state = load_latest_checkpoint_state(LIVE_SIM_ID)
 cap = state.get("capital", {}) if state else {}
 equity_total = (cap.get("available", 0) or 0) + (cap.get("allocated", 0) or 0) + (cap.get("reserved", 0) or 0)
 sizing_state = cap.get("sizing_state", {}) if state else {}
-
 st.markdown(_status_pill(is_paused), unsafe_allow_html=True)
 st.write("")
-
 tab_overview, tab_performance, tab_trades, tab_market = st.tabs(
     ["📊 Visão Geral", "📈 Performance & Risco", "📒 Trades", "💹 Mercado & Donchian"]
 )
-
 # ---------------------------------------------------------------------------
 # ABA 1 -- Visão Geral
 # ---------------------------------------------------------------------------
@@ -525,10 +406,8 @@ with tab_overview:
         f"<div style='padding-top:6px;'><div style='font-size:0.74rem; text-transform:uppercase; letter-spacing:.07em; color:#8b93a7; margin-bottom:8px;'>Monitor de edge</div>{_edge_badge(sizing_state.get('current_state'))}</div>",
         unsafe_allow_html=True,
     )
-
     st.write("")
     left, right = st.columns([1, 1.4])
-
     with left:
         st.subheader("Composição do capital")
         available, allocated, reserved = cap.get("available", 0) or 0, cap.get("allocated", 0) or 0, cap.get("reserved", 0) or 0
@@ -550,23 +429,50 @@ with tab_overview:
             st.plotly_chart(donut, use_container_width=True)
         else:
             st.info("Sem dados de capital ainda.")
-
     with right:
-        st.subheader("Posições em andamento")
+        st.subheader("Posições em andamento & P&L Não Realizado")
         positions = state.get("positions", {}) if state else {}
         open_positions = {sym: p for sym, p in positions.items() if p.get("in_position")}
         universe_size = len(state.get("price_history", {})) if state else 0
         st.caption(f"Universo: {universe_size} símbolos · Posições abertas: {len(open_positions)}")
-
         if open_positions:
             pos_df = pd.DataFrame([
                 {"símbolo": sym, "preço_entrada": p.get("entry_price"), "capital_alocado_usd": p.get("allocated_capital_usd"),
                  "atr_pct_na_entrada": p.get("atr_pct_at_entry")}
                 for sym, p in open_positions.items()
             ]).sort_values("capital_alocado_usd", ascending=False)
+
             if equity_total > 0:
                 pos_df["% do capital total"] = (pos_df["capital_alocado_usd"] / equity_total * 100).round(2)
-
+            current_prices = load_current_prices(LIVE_SIM_ID, pos_df["símbolo"].tolist())
+            pos_df["preço_atual"] = pos_df["símbolo"].map(current_prices)
+            entry_safe = pos_df["preço_entrada"].replace(0, float("nan"))
+            pos_df["p&l_não_realizado_%"] = (
+                (pos_df["preço_atual"] - pos_df["preço_entrada"]) / entry_safe * 100.0
+            ).round(2)
+            pos_df = pos_df.sort_values("p&l_não_realizado_%", ascending=False, na_position="last")
+            pnl_valid = pos_df["p&l_não_realizado_%"].dropna()
+            if not pnl_valid.empty:
+                m1, m2, m3 = st.columns(3)
+                m1.metric("P&L não realizado médio", f"{pnl_valid.mean():+.1f}%")
+                best_row = pos_df.loc[pnl_valid.idxmax()]
+                worst_row = pos_df.loc[pnl_valid.idxmin()]
+                m2.metric("Melhor posição", best_row["símbolo"], f"{best_row['p&l_não_realizado_%']:+.1f}%")
+                m3.metric("Pior posição", worst_row["símbolo"], f"{worst_row['p&l_não_realizado_%']:+.1f}%")
+                st.caption("P&L não realizado = variação % entre o preço de entrada e o preço mais recente na nuvem, "
+                           "SEM taxas -- só vira lucro/prejuízo de verdade quando a posição fechar de fato.")
+                pnl_bar = go.Figure(go.Bar(
+                    x=pos_df["p&l_não_realizado_%"], y=pos_df["símbolo"], orientation="h",
+                    marker=dict(color=["#2ecc71" if v >= 0 else "#e74c3c" for v in pos_df["p&l_não_realizado_%"].fillna(0)]),
+                    hovertemplate="%{y}: %{x:+.2f}%<extra></extra>",
+                ))
+                pnl_bar.update_layout(**PLOTLY_DARK_LAYOUT)
+                pnl_bar.update_layout(
+                    height=280, margin=dict(l=10, r=10, t=10, b=10),
+                    yaxis=dict(autorange="reversed", gridcolor="rgba(255,255,255,0.06)"),
+                    xaxis=dict(title="P&L não realizado (%)", gridcolor="rgba(255,255,255,0.06)", zeroline=True, zerolinecolor="rgba(255,255,255,0.25)"),
+                )
+                st.plotly_chart(pnl_bar, use_container_width=True)
             bar = go.Figure(go.Bar(
                 x=pos_df["capital_alocado_usd"], y=pos_df["símbolo"], orientation="h",
                 marker=dict(color="#3498db"),
@@ -574,169 +480,109 @@ with tab_overview:
             ))
             bar.update_layout(**PLOTLY_DARK_LAYOUT)
             bar.update_layout(
-                height=300, margin=dict(l=10, r=10, t=10, b=10),
+                height=260, margin=dict(l=10, r=10, t=10, b=10),
                 yaxis=dict(autorange="reversed", gridcolor="rgba(255,255,255,0.06)"),
-                xaxis=dict(title="USD alocado", gridcolor="rgba(255,255,255,0.06)"),
+                xaxis=dict(title="Capital alocado (USD)", gridcolor="rgba(255,255,255,0.06)"),
             )
             st.plotly_chart(bar, use_container_width=True)
-            st.dataframe(pos_df, use_container_width=True, hide_index=True)
         else:
-            st.caption("Nenhuma posição aberta no momento.")
-
+            st.info("Nenhuma posição aberta no momento.")
 # ---------------------------------------------------------------------------
 # ABA 2 -- Performance & Risco
 # ---------------------------------------------------------------------------
 with tab_performance:
+    st.subheader("Curva de Capital e Drawdown")
     eq_df = load_equity_history(LIVE_SIM_ID)
-    if eq_df.empty or len(eq_df) < 2:
-        st.info("Só existe 1 checkpoint na nuvem até agora (migração enxuta trouxe só o último). "
-                "A curva cresce a cada época real processada por _bob_cloud_live_step.py -- volte depois de alguns dias.")
-        if not eq_df.empty:
-            st.dataframe(eq_df, use_container_width=True, hide_index=True)
-    else:
-        eq_df = eq_df.copy()
+    if not eq_df.empty and len(eq_df) > 0:
+        # CORRECAO: peak_equity JA vem certo da query acima (o pico de
+        # verdade rastreado internamente pelo motor congelado, dentro de
+        # state->capital->peak_equity) -- NAO recalcular via cummax()
+        # sobre so' as poucas linhas de checkpoint que existem na nuvem
+        # ate' agora. Um cummax() local so' enxerga o que ja' foi migrado
+        # pra' cloud (hoje so' 2 checkpoints), entao ele SUBESTIMA o pico
+        # real sempre que o pico verdadeiro veio de antes da migracao --
+        # e' exatamente o caso agora: pico real ~$117.46, mas as 2 linhas
+        # disponiveis sao ambas ~$108.13, o que faria o cummax() mostrar
+        # 0% de drawdown quando o real e' -7.95% (a so' 2 pontos do
+        # disjuntor de -10%). Usar sempre o peak_equity do motor.
         eq_df["drawdown_pct"] = (eq_df["equity_total"] - eq_df["peak_equity"]) / eq_df["peak_equity"] * 100.0
-
-        st.subheader("Curva de capital ao longo das épocas")
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(
-            x=eq_df["epoch_index"], y=eq_df["equity_total"], name="Capital total",
-            line=dict(color="#2ecc71", width=2), fill="tozeroy", fillcolor="rgba(46,204,113,0.08)",
-            customdata=eq_df["simulated_time"].astype(str),
-            hovertemplate="Época %{x} (%{customdata})<br>Capital: $%{y:,.2f}<extra></extra>",
+        fig_eq = go.Figure()
+        fig_eq.add_trace(go.Scatter(
+            x=eq_df["simulated_time"], y=eq_df["equity_total"],
+            mode="lines+markers", name="Capital Total ($)",
+            line=dict(color="#2ecc71", width=2.5),
+            marker=dict(size=5),
         ))
-        fig.add_trace(go.Scatter(
-            x=eq_df["epoch_index"], y=eq_df["peak_equity"], name="Pico histórico",
-            line=dict(color="#95a5a6", dash="dot", width=1.5),
-            hovertemplate="Pico: $%{y:,.2f}<extra></extra>",
-        ))
-        fig.update_layout(**PLOTLY_DARK_LAYOUT)
-        fig.update_layout(xaxis_title="Época", yaxis_title="USD", height=380, margin=dict(l=10, r=10, t=20, b=10), hovermode="x unified")
-        st.plotly_chart(fig, use_container_width=True)
-
-        st.subheader("Drawdown (distância do pico histórico)")
-        fig_dd = go.Figure()
-        fig_dd.add_trace(go.Scatter(
-            x=eq_df["epoch_index"], y=eq_df["drawdown_pct"], name="Drawdown %",
-            line=dict(color="#e74c3c", width=1.5), fill="tozeroy", fillcolor="rgba(231,76,60,0.12)",
-        ))
-        fig_dd.add_hline(y=-10, line=dict(color="#e74c3c", dash="dash", width=1), annotation_text="disjuntor -10%", annotation_font_color="#e74c3c")
-        fig_dd.update_layout(**PLOTLY_DARK_LAYOUT)
-        fig_dd.update_layout(xaxis_title="Época", yaxis_title="% do pico", height=240, margin=dict(l=10, r=10, t=20, b=10))
-        st.plotly_chart(fig_dd, use_container_width=True)
-        st.caption("Linha tracejada mostra o limite do disjuntor de segurança (MAX_CUM_LOSS_PAUSE_PCT=10%) -- "
-                   "só para referência visual, o disjuntor de verdade roda dentro do motor, intocado.")
-
-    st.subheader("Monitor de edge ao longo das épocas")
-    edge_df = load_edge_monitor_history(LIVE_SIM_ID)
-    if edge_df.empty or len(edge_df) < 2:
-        st.info("Ainda não há histórico suficiente do monitor de edge (precisa de mais de 1 checkpoint). "
-                "Estado atual, no último checkpoint: " + (sizing_state.get("current_state") or "—"))
-    else:
-        edge_df = edge_df.copy()
-        state_order = {"NORMAL": 0, "ATENCAO": 1, "DEFENSIVO": 2, "PAUSA": 3, "DESCONHECIDO": -1}
-        edge_df["nivel"] = edge_df["edge_state"].map(state_order).fillna(-1)
-        colors = [EDGE_STATE_COLOR.get(s, "#95a5a6") for s in edge_df["edge_state"]]
-        fig_edge = go.Figure(go.Scatter(
-            x=edge_df["epoch_index"], y=edge_df["nivel"], mode="lines+markers",
-            line=dict(color="#3498db", width=1.5, shape="hv"),
-            marker=dict(color=colors, size=8, line=dict(color="#0b0f1a", width=1)),
-            text=edge_df["edge_state"], hovertemplate="Época %{x}: %{text}<extra></extra>",
-        ))
-        fig_edge.update_layout(**PLOTLY_DARK_LAYOUT)
-        fig_edge.update_layout(
-            height=200, margin=dict(l=10, r=10, t=10, b=10), xaxis_title="Época",
-            yaxis=dict(tickmode="array", tickvals=[0, 1, 2, 3], ticktext=["NORMAL", "ATENÇÃO", "DEFENSIVO", "PAUSA"],
-                       gridcolor="rgba(255,255,255,0.06)"),
+        fig_eq.update_layout(**PLOTLY_DARK_LAYOUT)
+        fig_eq.update_layout(
+            height=350, margin=dict(l=10, r=10, t=10, b=10),
+            yaxis=dict(title="USD"), xaxis=dict(title="Tempo Simulado"),
         )
-        st.plotly_chart(fig_edge, use_container_width=True)
-
+        st.plotly_chart(fig_eq, use_container_width=True)
+        st.subheader("Histórico do Monitor de Edge")
+        edge_df = load_edge_monitor_history(LIVE_SIM_ID)
+        if not edge_df.empty:
+            colors = edge_df["edge_state"].map(lambda s: EDGE_STATE_COLOR.get(s.upper(), "#95a5a6"))
+            fig_edge = go.Figure(go.Bar(
+                x=edge_df["simulated_time"], y=[1] * len(edge_df),
+                marker=dict(color=colors),
+                customdata=edge_df["edge_state"],
+                hovertemplate="Tempo: %{x}<br>Estado: %{customdata}<extra></extra>",
+            ))
+            fig_edge.update_layout(**PLOTLY_DARK_LAYOUT)
+            fig_edge.update_layout(
+                height=140, margin=dict(l=10, r=10, t=10, b=10),
+                yaxis=dict(showticklabels=False, showgrid=False, zeroline=False),
+                xaxis=dict(title="Épocas / Tempo Simulado"),
+            )
+            st.plotly_chart(fig_edge, use_container_width=True)
+    else:
+        st.info("Aguardando mais checkpoints na nuvem para renderizar a curva de capital.")
 # ---------------------------------------------------------------------------
-# ABA 3 -- Trades (MISSAO 15)
+# ABA 3 -- Trades Fechados
 # ---------------------------------------------------------------------------
 with tab_trades:
-    st.subheader("Estatísticas de trades fechados")
+    st.subheader("Histórico de Trades Fechados")
     trades_df = load_trade_stats(LIVE_SIM_ID)
-
-    if trades_df.empty:
-        st.info(
-            "Ainda não há trades fechados registrados na nuvem para esta simulação -- normal logo após a migração "
-            "enxuta (Missão 11), ou enquanto o tempo real ainda não completou uma época nova (24h desde o último "
-            "checkpoint). Assim que o motor fechar a primeira posição em uma época real, as estatísticas abaixo "
-            "aparecem automaticamente, calculadas a partir de mission7_experiences -- nenhum número é estimado ou "
-            "inventado enquanto não houver trade de verdade."
-        )
-    else:
-        n_total = len(trades_df)
+    if not trades_df.empty:
         wins = trades_df[trades_df["pnl_percent"] > 0]
-        losses = trades_df[trades_df["pnl_percent"] <= 0]
-        win_rate = len(wins) / n_total * 100 if n_total else 0.0
-        gross_win = wins["pnl_percent"].sum()
-        gross_loss = abs(losses["pnl_percent"].sum())
-        profit_factor = (gross_win / gross_loss) if gross_loss > 0 else float("inf") if gross_win > 0 else 0.0
+        win_rate = len(wins) / len(trades_df) * 100.0 if len(trades_df) > 0 else 0
 
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Trades fechados", n_total)
-        c2.metric("Taxa de acerto", f"{win_rate:.1f}%")
-        c3.metric("Fator de lucro", "∞" if profit_factor == float("inf") else f"{profit_factor:.2f}")
-        c4.metric("PnL médio por trade", f"{trades_df['pnl_percent'].mean():.2f}%")
-
-        st.caption("Taxa de acerto = trades com pnl_percent > 0 / total. Fator de lucro = soma dos ganhos ÷ soma "
-                   "absoluta das perdas (em pnl_percent) -- ambos calculados só sobre trades já RESOLVIDOS "
-                   "(coluna `resolved=true` em mission7_experiences).")
-
-        st.write("")
-        st.subheader("Histórico de trades (mais recentes primeiro)")
-        st.dataframe(trades_df, use_container_width=True, hide_index=True)
-
+        tc1, tc2, tc3 = st.columns(3)
+        tc1.metric("Total de trades fechados", len(trades_df))
+        tc2.metric("Taxa de acerto (Win Rate)", f"{win_rate:.1f}%")
+        tc3.metric("PnL médio por trade", f"{trades_df['pnl_percent'].mean():+.2f}%")
+        st.dataframe(trades_df, use_container_width=True)
+    else:
+        st.info("Nenhum trade fechado registrado até o momento. Como o BOB utiliza Donchian (seguidor de tendência), "
+                "as posições vencedoras permanecem abertas enquanto a tendência de alta se mantiver firme.")
 # ---------------------------------------------------------------------------
 # ABA 4 -- Mercado & Donchian
 # ---------------------------------------------------------------------------
 with tab_market:
-    st.subheader("Preço e canais de Donchian (dados ao vivo, por símbolo)")
-    if state:
-        symbols = sorted(state.get("price_history", {}).keys())
-    else:
-        symbols = []
-    if symbols:
-        symbol = st.selectbox("Símbolo", symbols, index=symbols.index("BTCUSDT") if "BTCUSDT" in symbols else 0)
-        hist = state["price_history"].get(symbol, [])
-        hist_df = pd.DataFrame(hist, columns=["open_time", "price"])
-        if not hist_df.empty:
-            hist_df["ts"] = pd.to_datetime(hist_df["open_time"], unit="ms", utc=True)
-            entry_window = max(1, N_ENTRY_HOURS // 24)  # HOUR_MS/epoch=24h -> 1 ponto por dia no price_history
-            exit_window = max(1, N_EXIT_HOURS // 24)
-            hist_df["canal_entrada_max"] = hist_df["price"].rolling(entry_window, min_periods=entry_window).max()
-            hist_df["canal_entrada_min"] = hist_df["price"].rolling(entry_window, min_periods=entry_window).min()
-            hist_df["canal_saida_max"] = hist_df["price"].rolling(exit_window, min_periods=exit_window).max()
-            hist_df["canal_saida_min"] = hist_df["price"].rolling(exit_window, min_periods=exit_window).min()
-
-            fig2 = go.Figure()
-            fig2.add_trace(go.Scatter(x=hist_df["ts"], y=hist_df["canal_entrada_max"], name=f"Donchian entrada ({N_ENTRY_HOURS//24}d) topo",
-                                       line=dict(color="rgba(231,76,60,0.55)", dash="dash", width=1)))
-            fig2.add_trace(go.Scatter(x=hist_df["ts"], y=hist_df["canal_entrada_min"], name=f"Donchian entrada ({N_ENTRY_HOURS//24}d) fundo",
-                                       line=dict(color="rgba(231,76,60,0.55)", dash="dash", width=1),
-                                       fill="tonexty", fillcolor="rgba(231,76,60,0.05)"))
-            fig2.add_trace(go.Scatter(x=hist_df["ts"], y=hist_df["canal_saida_max"], name=f"Donchian saída ({N_EXIT_HOURS//24}d) topo",
-                                       line=dict(color="rgba(243,156,18,0.65)", dash="dot", width=1)))
-            fig2.add_trace(go.Scatter(x=hist_df["ts"], y=hist_df["canal_saida_min"], name=f"Donchian saída ({N_EXIT_HOURS//24}d) fundo",
-                                       line=dict(color="rgba(243,156,18,0.65)", dash="dot", width=1)))
-            fig2.add_trace(go.Scatter(x=hist_df["ts"], y=hist_df["price"], name="Preço", line=dict(color="#3498db", width=2.2)))
-            fig2.update_layout(**PLOTLY_DARK_LAYOUT)
-            fig2.update_layout(height=460, margin=dict(l=10, r=10, t=20, b=10))
-            st.plotly_chart(fig2, use_container_width=True)
-            st.caption("Canais calculados aqui só para visualização (aproximação com pandas.rolling sobre o "
-                       "price_history do último checkpoint) -- o motor de verdade usa donchian_engine._rolling_extreme, "
-                       "intocado, para decidir. Com poucos dias de histórico ainda no ar, os canais completos "
-                       "(20d/10d) só aparecem depois que houver dados suficientes.")
+    st.subheader("Visão de Mercado & Canais Donchian")
+    universe = list(state.get("price_history", {}).keys()) if state else []
+    if universe:
+        selected_sym = st.selectbox("Selecione o ativo", sorted(universe))
+        m_df = load_market_states(LIVE_SIM_ID, selected_sym, limit=500)
+        if not m_df.empty:
+            fig_m = go.Figure()
+            fig_m.add_trace(go.Scatter(
+                x=m_df["open_time"], y=m_df["price"],
+                mode="lines", name=selected_sym,
+                line=dict(color="#3498db", width=2),
+            ))
+            fig_m.update_layout(**PLOTLY_DARK_LAYOUT)
+            fig_m.update_layout(
+                height=400, margin=dict(l=10, r=10, t=10, b=10),
+                yaxis=dict(title="Preço (USDT)"), xaxis=dict(title="Data / Hora (UTC)"),
+            )
+            st.plotly_chart(fig_m, use_container_width=True)
         else:
-            st.info("Sem histórico de preço para este símbolo ainda.")
+            st.info(f"Sem dados de mercado gravados para {selected_sym}.")
     else:
-        st.info("Sem checkpoint carregado ainda.")
-
-st.divider()
-st.caption(f"Última atualização do painel: {datetime.now(timezone.utc).isoformat()}")
-
+        st.info("Universo de ativos indisponível no checkpoint atual.")
+# Auto-refresh logic se ativado
 if auto:
     time.sleep(30)
     st.rerun()
